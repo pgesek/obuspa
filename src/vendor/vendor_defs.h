@@ -135,14 +135,14 @@
 //-----------------------------------------------------------------------------------------
 // OUI (Organization Unique Identifier) to use for this CPE. This code will be unique to the manufacturer
 // This may be overridden by an environment variable. See GetDefaultOUI(). Or by a vendor hook for Device.DeviceInfo.ManufacturerOUI (if REMOVE_DEVICE_INFO is defined)
-#define VENDOR_OUI "012345"
+#define VENDOR_OUI "000001"
 
 // Various defines for constant parameters in Device.DeviceInfo
 // These defines are only used if USP Agent core implements DeviceInfo (see REMOVE_DEVICE_INFO above)
 // These defines MUST be modified by the vendor
-#define VENDOR_PRODUCT_CLASS "G3100"   // Configures the value of Device.DeviceInfo.ProductClass
-#define VENDOR_MANUFACTURER  "G3100-Manufacturer"   // Configures the value of Device.DeviceInfo.Manufacturer
-#define VENDOR_MODEL_NAME    "G3100"   // Configures the value of Device.DeviceInfo.ModelName
+#define VENDOR_PRODUCT_CLASS "OBUSPA"   // Configures the value of Device.DeviceInfo.ProductClass
+#define VENDOR_MANUFACTURER  "BroadbandForum"   // Configures the value of Device.DeviceInfo.Manufacturer
+#define VENDOR_MODEL_NAME    "OBUSPA"   // Configures the value of Device.DeviceInfo.ModelName
 
 // URI of data model implemented by USP Agent
 #define BBF_DATA_MODEL_URI "urn:broadband-forum-org:tr-181-2-12-0"
