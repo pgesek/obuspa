@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2020, Broadband Forum
- * Copyright (C) 2016-2020  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -41,6 +41,9 @@
 #ifndef PATH_RESOLVER_H
 #define PATH_RESOLVER_H
 
+#include <limits.h>
+
+#include "usp_api.h"
 #include "str_vector.h"
 
 // Enumeration determining what we are attempting to resolve with the path expression
@@ -52,11 +55,11 @@ typedef enum
     kResolveOp_Add,     // Resolves objects that are not fully qualified
     kResolveOp_Del,     // Resolves fully qualified objects that exist
     kResolveOp_Oper,    // Resolves operations (for when a request is made to perform an operation)
-    kResolveOp_Event,   // Resolves events (currently not triggered by the code - included for completeness)
+    kResolveOp_Event,   // Resolves events
     kResolveOp_Instances, // Resolves fully qualified objects that exist
 
     // The following operations are similar to their conterparts above, other than they check different permission bits
-    kResolveOp_SubsValChange, // Resolves the ReferenceList of a value change subscription. Forgiving of errors.
+    kResolveOp_SubsValChange, // Resolves the ReferenceList of a value change subscription. Forgiving of errors and does not include VALUE_CHANGE_WILL_IGNORE parameters
     kResolveOp_SubsAdd, // Resolves the ReferenceList of an object creation subscription
     kResolveOp_SubsDel, // Resolves the ReferenceList of an object deletion subscription
     kResolveOp_SubsOper,// Resolves the ReferenceList of an operation complete subscription
@@ -65,15 +68,24 @@ typedef enum
     // Special resolve operations
     kResolveOp_GetBulkData, // Resolves get parameters. Unforgiving of permissions. Only allows partial path and wildcards.
 
-    kResolveOp_Any,     // This just checks that the expression is syntactically correct, but does not check resolved paths for validity
+    // The following resolve operations just check that the expression is syntactically correct.
+    // They do not check resolved paths for validity
+    kResolveOp_ForgivingRef,  // Forgiving of permissions and errors. Used when resolving a reference containing a search expression.
+    kResolveOp_StrictRef,     // Not forgiving of permissions and errors. Used when resolving a reference containing a search expression.
+    kResolveOp_Any,           // Not forgiving of permissions and errors.
 } resolve_op_t;
 
-// Bitmask for the flags argument of PATH_RESOLVER_ResolvePath(). Thse flags control resolving of the path
-#define GET_ALL_INSTANCES 0x0001
+// Bitmask for the flags argument of PATH_RESOLVER_ResolvePath(). These flags control resolving of the path
+#define DONT_LOG_RESOLVER_ERRORS 0x0001  // Don't log any errors that the path resolver finds. This flag is used to prevent unnecessary logging when periodically resolving subscription paths
+#define GET_ALL_INSTANCES        0x0002  // Resolve all instances recursively, not just the ones in the path expression (implements first_level_only=false in Get Instances request)
+
+// Constant for depth argument to indicate traversal of all hierarchical levels in the data model when performing partial path resolution
+#define FULL_DEPTH  (INT_MAX)
 
 // API
-int PATH_RESOLVER_ResolveDevicePath(char *path, str_vector_t *sv, int_vector_t *gv, resolve_op_t op, int *separator_split, combined_role_t *combined_role, unsigned flags);
-int PATH_RESOLVER_ResolvePath(char *path, str_vector_t *sv, int_vector_t *gv, resolve_op_t op, int *separator_split, combined_role_t *combined_role, unsigned flags);
+int PATH_RESOLVER_ResolveDevicePath(char *path, str_vector_t *sv, int_vector_t *gv, resolve_op_t op, int depth, combined_role_t *combined_role, unsigned flags);
+int PATH_RESOLVER_ResolvePath(char *path, str_vector_t *sv, int_vector_t *gv, resolve_op_t op, int depth, combined_role_t *combined_role, unsigned flags);
+int PATH_RESOLVER_ValidatePath(char *path, subs_notify_t notify_type);
 
 
 

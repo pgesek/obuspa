@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2021, Broadband Forum
- * Copyright (C) 2016-2021  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -57,7 +57,6 @@
 // Structure used to marshall entries in get group vector for a path expression
 typedef struct
 {
-    int separator_split;    // Used to split resolved parameter path into resolved object and resolved sub-path. It is a count of number of dot separators included in the 'object' portion of the path
     int index;              // start index of parameters in get group vector for this path expression
     int num_entries;        // number of entries in the get group vector for this path expression
     int err_code;           // error code if path resolution failed for this path expression
@@ -66,9 +65,9 @@ typedef struct
 
 //------------------------------------------------------------------------------
 // Forward declarations. Note these are not static, because we need them in the symbol table for USP_LOG_Callstack() to show them
-void ExpandGetPathExpression(int get_expr_index, char *path_expr, get_expr_info_t *gi, group_get_vector_t *ggv);
+void ExpandGetPathExpression(int get_expr_index, char *path_expr, int depth, get_expr_info_t *gi, group_get_vector_t *ggv);
 void FormPathExprResponse(int get_expr_index, char *path_expr, get_expr_info_t *gi, group_get_vector_t *ggv, Usp__Msg *resp);
-void AddResolvedPathResult(Usp__GetResp__RequestedPathResult *req_path_result, char *path, char *value, int separator_split);
+void AddResolvedPathResult(Usp__GetResp__RequestedPathResult *req_path_result, char *path, char *value);
 Usp__GetResp__ResolvedPathResult *FindResolvedPath(Usp__GetResp__RequestedPathResult *req_path_result, char *obj_path);
 Usp__Msg *CreateGetResp(char *msg_id);
 Usp__GetResp__RequestedPathResult *AddGetResp_ReqPathRes(Usp__Msg *resp, char *requested_path, int err_code, char *err_msg);
@@ -85,18 +84,19 @@ AddResolvedPathRes_ParamsEntry(Usp__GetResp__ResolvedPathResult *resolved_path_r
 **
 ** \param   usp - pointer to parsed USP message structure. This is always freed by the caller (not this function)
 ** \param   controller_endpoint - endpoint which sent this message
-** \param   mrt - details of where response to this USP message should be sent
+** \param   mtpc - details of where response to this USP message should be sent
 **
 ** \return  None - This code must handle any errors by sending back error messages
 **
 **************************************************************************/
-void MSG_HANDLER_HandleGet(Usp__Msg *usp, char *controller_endpoint, mtp_reply_to_t *mrt)
+void MSG_HANDLER_HandleGet(Usp__Msg *usp, char *controller_endpoint, mtp_conn_t *mtpc)
 {
     int i;              // Used to iterate over path expressions in the USP get request message
     char **path_exprs;
     int num_path_expr;
     Usp__Msg *resp = NULL;
     int size;
+    unsigned depth;
     group_get_vector_t ggv;
     get_expr_info_t *get_expr_info;
 
@@ -108,7 +108,7 @@ void MSG_HANDLER_HandleGet(Usp__Msg *usp, char *controller_endpoint, mtp_reply_t
         (usp->body->request->get == NULL) )
     {
         USP_ERR_SetMessage("%s: Incoming message is invalid or inconsistent", __FUNCTION__);
-        resp = ERROR_RESP_CreateSingle(usp->header->msg_id, USP_ERR_MESSAGE_NOT_UNDERSTOOD, resp, NULL);
+        resp = ERROR_RESP_CreateSingle(usp->header->msg_id, USP_ERR_MESSAGE_NOT_UNDERSTOOD, resp);
         goto exit;
     }
 
@@ -123,6 +123,14 @@ void MSG_HANDLER_HandleGet(Usp__Msg *usp, char *controller_endpoint, mtp_reply_t
         goto exit;
     }
 
+    // Calculate the number of hierarchical levels to traverse in the data model when performing partial path resolution
+    // NOTE: protocol buffer has depth as an unsigned quantity, but internally we use a signed number, so limit range to that of a signed number
+    depth = usp->body->request->get->max_depth;
+    if ((depth == 0) || (depth > FULL_DEPTH))
+    {
+        depth = FULL_DEPTH;
+    }
+
     // Allocate vector to store marshalling info for each path expression
     size = num_path_expr*sizeof(get_expr_info_t);
     get_expr_info = USP_MALLOC(size);
@@ -132,7 +140,7 @@ void MSG_HANDLER_HandleGet(Usp__Msg *usp, char *controller_endpoint, mtp_reply_t
     GROUP_GET_VECTOR_Init(&ggv);
     for (i=0; i < num_path_expr; i++)
     {
-        ExpandGetPathExpression(i, path_exprs[i], &get_expr_info[i], &ggv);
+        ExpandGetPathExpression(i, path_exprs[i], (int)depth, &get_expr_info[i], &ggv);
     }
 
     // Get all parameters
@@ -154,7 +162,7 @@ void MSG_HANDLER_HandleGet(Usp__Msg *usp, char *controller_endpoint, mtp_reply_t
     USP_FREE(get_expr_info);
 
 exit:
-    MSG_HANDLER_QueueMessage(controller_endpoint, resp, mrt);
+    MSG_HANDLER_QueueMessage(controller_endpoint, resp, mtpc);
     usp__msg__free_unpacked(resp, pbuf_allocator);
 }
 
@@ -166,13 +174,14 @@ exit:
 **
 ** \param   get_expr_index - index of the path expression in the USP Get request message
 ** \param   path_expr - USP path expression specifying which parameters to get
+** \param   depth - Number of hierarchical levels to traverse in the data model when performing partial path resolution
 ** \param   gi - pointer to info about specified path expression
 ** \param   ggv - pointer to group get vector to add params found in this path expression to
 **
 ** \return  None
 **
 **************************************************************************/
-void ExpandGetPathExpression(int get_expr_index, char *path_expr, get_expr_info_t *gi, group_get_vector_t *ggv)
+void ExpandGetPathExpression(int get_expr_index, char *path_expr, int depth, get_expr_info_t *gi, group_get_vector_t *ggv)
 {
     int err;
     str_vector_t params;
@@ -184,7 +193,7 @@ void ExpandGetPathExpression(int get_expr_index, char *path_expr, get_expr_info_
     STR_VECTOR_Init(&params);
     INT_VECTOR_Init(&group_ids);
     MSG_HANDLER_GetMsgRole(&combined_role);
-    err = PATH_RESOLVER_ResolveDevicePath(path_expr, &params, &group_ids, kResolveOp_Get, &gi->separator_split, &combined_role, 0);
+    err = PATH_RESOLVER_ResolveDevicePath(path_expr, &params, &group_ids, kResolveOp_Get, depth, &combined_role, 0);
     if (err != USP_ERR_OK)
     {
         gi->err_code = err;
@@ -252,31 +261,15 @@ void FormPathExprResponse(int get_expr_index, char *path_expr, get_expr_info_t *
         return;
     }
 
-    // If there was an error in getting any of the parameters associated with the path expression,
-    // then just add the first error, without any of the parameter values, for this path expression result
-    for (i=0; i < gi->num_entries; i++)
-    {
-        gge = &ggv->vector[gi->index + i];
-        if (gge->err_code != USP_ERR_OK)
-        {
-            (void)AddGetResp_ReqPathRes(resp, path_expr, gge->err_code, gge->err_msg);
-            return;
-        }
-    }
-
-    // If the code gets here, then the value of all parameters were retrieved successfully, so add their values to the result_params
+    // Add the values of all parameters that were retrieved successfully to the result_params
     req_path_result = AddGetResp_ReqPathRes(resp, path_expr, USP_ERR_OK, "");
     for (i=0; i < gi->num_entries; i++)
     {
         gge = &ggv->vector[gi->index + i];
-
-#ifdef GET_RESPONSE_SIMPLE_FORMAT
-        // Simple format contains a resolved_path_result for every object (and sub object)
-        AddResolvedPathResult(req_path_result, gge->path, gge->value, 0);
-#else
-        // Original format contains a resolved_path_result from the first point in the path expression that is resolved
-        AddResolvedPathResult(req_path_result, gge->path, gge->value, gi->separator_split);
-#endif
+        if (gge->err_code == USP_ERR_OK)
+        {
+            AddResolvedPathResult(req_path_result, gge->path, gge->value);
+        }
     }
 }
 
@@ -291,21 +284,18 @@ void FormPathExprResponse(int get_expr_index, char *path_expr, get_expr_info_t *
 ** \param   req_path_result - pointer to requested_path_result to add this entry to
 ** \param   path - full data model path of the parameter
 ** \param   value - value of the parameter
-** \param   separator_split - denotes where to split the parameter path based on the number of separators for the object that required resolution
-**                            The path is split into an object (that required resolution),
-**                            and a sub path which did not require resolution
 **
 ** \return  None
 **
 **************************************************************************/
-void AddResolvedPathResult(Usp__GetResp__RequestedPathResult *req_path_result, char *path, char *value, int separator_split)
+void AddResolvedPathResult(Usp__GetResp__RequestedPathResult *req_path_result, char *path, char *value)
 {
     char obj_path[MAX_DM_PATH];
     char *param_name;
     Usp__GetResp__ResolvedPathResult *resolved_path_res;
 
     // Split the parameter into the parent object path and the name of the parameter within the object
-    param_name = TEXT_UTILS_SplitPathAtSeparator(path, obj_path, sizeof(obj_path), separator_split);
+    param_name = TEXT_UTILS_SplitPath(path, obj_path, sizeof(obj_path));
 
     // Add a resolved path result, if we don't already have one for the specified parent object
     resolved_path_res = FindResolvedPath(req_path_result, obj_path);
@@ -334,11 +324,24 @@ Usp__GetResp__ResolvedPathResult *FindResolvedPath(Usp__GetResp__RequestedPathRe
 {
     int i;
     int num_entries;
+    int index;
     Usp__GetResp__ResolvedPathResult *resolved_path_result;
 
-    // Iterate over all resolved path results, trying to find the one which matches the specified object path
+    // Determine limits of backwards search for matching object path
+    // NOTE: The limit is fairly arbitrary. It is a balance between minimizing the USP response message size
+    //       (trying to prevent any ResolvedPathResults with duplicate ResolvedPaths) and spending too much time
+    //       searching the USP response to avoid duplicates. Should the limit not be sufficient, it is acceptable
+    //       for USP Responses to contain ResolvedPathResults with duplicate ResolvedPaths.
+    #define RESOLVED_PATH_SEARCH_LIMIT 10
     num_entries = req_path_result->n_resolved_path_results;
-    for (i=0; i<num_entries; i++)
+    index = num_entries - RESOLVED_PATH_SEARCH_LIMIT;
+    if (index < 0)
+    {
+        index = 0;
+    }
+
+    // Search backwards, trying to find the one which matches the specified object path
+    for (i=num_entries-1; i>=index; i--)
     {
         resolved_path_result = req_path_result->resolved_path_results[i];
         if (strcmp(resolved_path_result->resolved_path, obj_path)==0)
@@ -367,42 +370,20 @@ Usp__GetResp__ResolvedPathResult *FindResolvedPath(Usp__GetResp__RequestedPathRe
 **************************************************************************/
 Usp__Msg *CreateGetResp(char *msg_id)
 {
-    Usp__Msg *resp;
-    Usp__Header *header;
-    Usp__Body *body;
-    Usp__Response *response;
+    Usp__Msg *msg;
     Usp__GetResp *get_resp;
 
-    // Allocate memory to store the USP message
-    resp = USP_MALLOC(sizeof(Usp__Msg));
-    usp__msg__init(resp);
-
-    header = USP_MALLOC(sizeof(Usp__Header));
-    usp__header__init(header);
-
-    body = USP_MALLOC(sizeof(Usp__Body));
-    usp__body__init(body);
-
-    response = USP_MALLOC(sizeof(Usp__Response));
-    usp__response__init(response);
-
+    // Create Get Response
+    msg = MSG_HANDLER_CreateResponseMsg(msg_id, USP__HEADER__MSG_TYPE__GET_RESP, USP__RESPONSE__RESP_TYPE_GET_RESP);
     get_resp = USP_MALLOC(sizeof(Usp__GetResp));
     usp__get_resp__init(get_resp);
+    msg->body->response->get_resp = get_resp;
 
-    // Connect the structures together
-    resp->header = header;
-    header->msg_id = USP_STRDUP(msg_id);
-    header->msg_type = USP__HEADER__MSG_TYPE__GET_RESP;
-
-    resp->body = body;
-    body->msg_body_case = USP__BODY__MSG_BODY_RESPONSE;
-    body->response = response;
-    response->resp_type_case = USP__RESPONSE__RESP_TYPE_GET_RESP;
-    response->get_resp = get_resp;
-    get_resp->n_req_path_results = 0;    // Start from an empty response list
+    // Start from an empty response list
+    get_resp->n_req_path_results = 0;
     get_resp->req_path_results = NULL;
 
-    return resp;
+    return msg;
 }
 
 /*********************************************************************//**
@@ -492,7 +473,7 @@ Usp__GetResp__ResolvedPathResult *AddReqPathRes_ResolvedPathResult(Usp__GetResp_
 **
 ** Dynamically adds a result_params entry to a resolved_path_result object
 **
-** \param   resolved_path_res - pointer to resolved_oath_result to add this entry to
+** \param   resolved_path_res - pointer to resolved_path_result to add this entry to
 ** \param   param_name - name of the parameter (not including object path) of the parameter to add to the map
 ** \param   value - value of the parameter
 **

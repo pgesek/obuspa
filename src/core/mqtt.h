@@ -1,8 +1,8 @@
 /*
  *
- * Copyright (C) 2019-2021, Broadband Forum
+ * Copyright (C) 2019-2024, Broadband Forum
  * Copyright (C) 2020-2021, BT PLC
- * Copyright (C) 2021  CommScope, Inc
+ * Copyright (C) 2021-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -38,11 +38,14 @@
 #ifndef MQTT_H
 #define MQTT_H
 
+#include <stdbool.h>
+
+#include "vendor_defs.h"  // For MAX_MQTT_SUBSCRIPTIONS
 #include "usp-msg.pb-c.h"
 #include "mtp_exec.h"
 #include "socket_set.h"
+#include "kv_vector.h"
 
-#include <stdbool.h>
 
 typedef struct
 {
@@ -53,12 +56,10 @@ typedef struct
 
 typedef enum
 {
-    kMqttQos_Worst = 0,
     kMqttQos_MostOnce = 0,       // TCP Fire and forget, the worst QOS
     kMqttQos_AtLeastOnce = 1,    // Acknowledged Message, can be sent more than once
     kMqttQos_ExactlyOnce = 2,    // Fully ackd message, always received once
-    kMqttQos_Best = 2,
-    kMqttQos_Default = kMqttQos_Best,
+    kMqttQos_Default = MQTT_FALLBACK_QOS,
 } mqtt_qos_t;
 
 typedef enum
@@ -72,12 +73,13 @@ typedef enum
 
 typedef enum
 {
-    kMqttSubState_Unsubscribed = 0,
-    kMqttSubState_Subscribing,
-    kMqttSubState_Subscribed,
-    kMqttSubState_Unsubscribing,
-    kMqttSubState_Resubscribing,
-    kMqttSubState_Error,
+    kMqttSubState_Unsubscribed = 0, // Not currently subscribed
+    kMqttSubState_Subscribing,      // MQTT SUBSCRIBE message is being sent, waiting for SUBACK
+    kMqttSubState_Subscribed,       // Subscribed (MQTT SUBACK has been received)
+    kMqttSubState_Failed,           // Attempted to subscribe, but SUBACK indicated that subscription failed
+    kMqttSubState_Unsubscribing,    // MQTT UNSUBSCRIBE is being sent. When UNSUBACK is received, the subscription will move to the unsubscribed state
+    kMqttSubState_Resubscribing,    // MQTT UNSUBSCRIBE is being sent. When UNSUBACK is received, a subscribe will be sent for the new topic.
+                                    // Subscription stays in this state until SUBACK is received
 } mqtt_substate_t;
 
 typedef enum
@@ -87,13 +89,26 @@ typedef enum
     kMqttTSprotocol_Max,
 } mqtt_tsprotocol_t;
 
+// Structure used by device_mqtt.c, containing the configuration of an MQTT subscription
 typedef struct
 {
     int instance;
     mqtt_qos_t qos;
     char* topic;
     bool enabled;
-    int mid; // Last mid for subscribe message - to identify the SUBACK
+} mqtt_subs_config_t;
+
+// Structure used by mqtt.c, containing the configuration and current state of an MQTT subscription
+typedef struct
+{
+    // Configuration
+    int instance;
+    mqtt_qos_t qos;
+    char* topic;
+    bool enabled;
+
+    // State
+    int mid; // Last mid for subscribe or unsubscribe message - to identify the SUBACK/UNSUBACK
     mqtt_substate_t state;
 } mqtt_subscription_t;
 
@@ -104,17 +119,16 @@ typedef struct
     int keepalive;                // Keepalive setting for broker connection
     char* username;               // Username to connect to broker
     char* password;               // Password to connect to broker
+    char *alpn;                   // Application Layer Protocol Negotiation options to send in SSL handshake (comma separated list)
     int instance;                 // Client instance (Device.MQTT.Client.{i})
     bool enable;
 
-    mqtt_protocolver_t version;      // MQTT protocol version to use
+    mqtt_protocolver_t version;   // MQTT protocol version to use
 
-    char* topic; // Topic to publish to - controller should sub to this
-
-    // Response topic, may be used - or not. Agent should sub to this.
-    // Depends on the configuration in the broker (in v5.0)
-    char* response_topic;
-    mqtt_qos_t publish_qos;
+    char* response_topic;         // Agent's topic: Topic which agent subscribes to, and Controller publishes to
+                                  // NOTE: If not configured in Device.LocalAgent.MTP.{i}.MQTT.ResponseTopicConfigured, then this variable may be set to NULL
+    mqtt_qos_t publish_qos;       // Agent's PublishQos: used to set mqtt_send_item_t.qos variable, when building a msg to send.
+                                  // NOTE: If not configured in Device.LocalAgent.MTP.{i}.MQTT.PublishQoS, then its value is kMqttQos_Default
 
     // V5 Params
     char* client_id;
@@ -125,329 +139,36 @@ typedef struct
     bool clean_session;
     bool clean_start;
     bool request_response_info;
-    bool request_problem_info;
     char* response_information;
 
-#if 0
-    // These items are not currently used.
-    // Most of these items are not really required for essential MQTT
-    // operation. Some could be added easily though.
-    // TODO: Add these
-    unsigned int session_expiry;
-    unsigned int receive_max;
-    unsigned int max_packet_size;
-    unsigned int topic_alias_max;
-    bool will_enable;
-    unsigned int will_qos;
-    bool will_retain;
-    unsigned int will_delay_interval;
-    unsigned int will_message_expiry;
-    char* will_content_type;
-    char* will_response_topic;
-    char* will_topic;
-    char* will_value;
-    unsigned int pubmsg_expinterval;
-    unsigned int message_retrytime;
-    char* auth_method;
-#endif
     mqtt_retry_params_t retry;
 } mqtt_conn_params_t;
 
-/*********************************************************************//**
-** MQTT_Init
-**
-** Initialise the MQTT component - basically a constructor
-**
-** \param None
-**
-** \return USP_ERR_OK on success, USP_ERR_XXX otherwise
-**
-**************************************************************************/
+//------------------------------------------------------------------------------
+// API
 int MQTT_Init(void);
-
-/*********************************************************************//**
-** MQTT_Destroy
-**
-** Destroy the component - destructor for everything
-**
-** \param None
-** \return None
-**
-**************************************************************************/
 void MQTT_Destroy(void);
-
-
-/*********************************************************************//**
-** MQTT_Start
-**
-** Called before starting all MQTT connections
-**
-** \param None
-** \return USP_ERR_OK on success, USP_ERR_XXX otherwise
-**
-**************************************************************************/
 int MQTT_Start(void);
-
-/*********************************************************************//**
-** MQTT_Stop
-**
-** Called before starting all MQTT connections
-**
-** \param None
-** \return USP_ERR_OK on success, USP_ERR_XXX otherwise
-**
-**************************************************************************/
 void MQTT_Stop(void);
-
-
-
-/*********************************************************************//**
-** MQTT_EnableClient
-**
-** Enable the MQTT client connection to the broker with given params and topic
-**
-** \param mqtt_params - pointer to data model parameters specifying the mqtt params
-** \param subscriptions[MAX_MQTT_SUBSCRIPTIONS] - subscriptions to use for this client
-**
-**
-**************************************************************************/
-int MQTT_EnableClient(mqtt_conn_params_t *mqtt_params, mqtt_subscription_t subscriptions[MAX_MQTT_SUBSCRIPTIONS]);
-
-
-/*********************************************************************//**
-** MQTT_DisableClient
-**
-** Disable the MQTT client connection given the instance id
-**
-** \param instance - instance id to identify the connection
-** \param purge_queued_messages - boolean flag to either clean all queued messages or keep them for next init.
-**  Normally purge unless retrying a connection
-**
-** \return USP_ERR_OK on success, USP_ERR_XXX otherwise
-**
-**************************************************************************/
-int MQTT_DisableClient(int instance, bool purge_queued_messages);
-
-
-/*********************************************************************//**
-** MQTT_QueueBinaryMessage
-**
-** Queue a binary message onto an MQTT connection
-**
-** \param usp_msg_type - Type of the USP message contained in the pbuf - used for debug logging
-** \param instance - instance number for the client in Device.MQTT.Client.{i}
-** \param topic - name of the agent's MQTT topic configured for this connection in the data model
-** \param pbuf - ptr to the buffer containing the protocol buffer. Ownership of this passes to this code (on success)
-** \param pbuf_len - length of pbuf
-**
-** \return USP_ERR_OK on success, USP_ERR_XXX otherwise
-**
-**************************************************************************/
-int MQTT_QueueBinaryMessage(Usp__Header__MsgType usp_msg_type, int instance, char *topic,
-        unsigned char *pbuf, int pbuf_len);
-
-
-/*********************************************************************//**
-** MQTT_ScheduleReconnect
-**
-** Signals that an MQTT reconnect occurs when all queued message have been sent
-** See comment header above definition of scheduled_action_t for an explanation of this and why
-**
-** \param mqtt_params - pointer to data model parameters specifying the MQTT connection
-**
-** \return USP_ERR_OK on success, USP_ERR_XXX otherwise. If connection fails, it will be retried later
-**
-**************************************************************************/
-void MQTT_ScheduleReconnect(mqtt_conn_params_t *mqtt_params);
-
-
-/*********************************************************************//**
-** MQTT_ActivateScheduledActions
-**
-** Called when all USP response messages have been queued
-** This function activates all scheduled actions which have been signalled
-** See comment header above definition of scheduled_action_t for an explanation of how scheduled actions work and why
-**
-**
-** \param None
-**
-** \return None
-**
-**************************************************************************/
+void MQTT_ModifyConnectedControllers(int instance, kv_vector_t *controller_topics);
+int MQTT_EnableClient(mqtt_conn_params_t *mqtt_params, mqtt_subs_config_t subscriptions[MAX_MQTT_SUBSCRIPTIONS], kv_vector_t *controller_topics);
+int MQTT_DisableClient(int instance);
+int MQTT_QueueBinaryMessage(mtp_send_item_t *msi, int instance, char *topic, time_t expiry_time);
+void MQTT_UpdateConnectionParams(mqtt_conn_params_t *mqtt_params, bool schedule_reconnect);
 void MQTT_ActivateScheduledActions(void);
-
-
-/*********************************************************************//**
-** MQTT_GetMtpStatus
-**
-**
-**
-** \param instance - the Device.MQTT.Client.{i} number
-**
-** \return mtp_status_t -
-**
-**************************************************************************/
 mtp_status_t MQTT_GetMtpStatus(int instance);
-
-
-/*********************************************************************//**
-** MQTT_GetClientStatus
-**
-** Get a string of the connection status for the device model items Device.MQTT.Client.{i}.Status
-**
-** \param instance - Instance ID from Device.MQTT.Client.{i}
-**
-** \return char string of connection status
-**
-**************************************************************************/
 const char* MQTT_GetClientStatus(int instance);
-
-
-/*********************************************************************//**
-** MQTT_UpdateRetryParams
-**
-**
-** \param instance - Device.MQTT.Client.{i} number for connection
-** \param retry_params - pointer to retry parameters to update to
-**
-** \return None
-**
-**************************************************************************/
 void MQTT_UpdateRetryParams(int instance, mqtt_retry_params_t *retry_params);
-
-/*********************************************************************//**
-** MQTT_AreAllResponsesSent
-**
-**
-** \param  None
-**
-** \return true if all responses have been sent
-**
-**************************************************************************/
 bool MQTT_AreAllResponsesSent(void);
-
-/*********************************************************************//**
-** MMQTT_ProcessAllActivity
-**
-**
-** \param  None
-**
-** \return None
-**
-**************************************************************************/
 void MQTT_ProcessAllActivity(void);
-
-/*********************************************************************//**
-** MQTT_AddSubscription
-**
-**
-** \param instance - Device.MQTT.Client.{i} number for connection
-** \param subscription - pointer to subscription to add
-**
-** \return None
-**
-**************************************************************************/
-int MQTT_AddSubscription(int instance, mqtt_subscription_t* subscription);
-
-
-/*********************************************************************//**
-** MQTT_DeleteSubscription
-**
-**
-** \param instance - Device.MQTT.Client.{i} number for connection
-** \param retry_params - pointer to subscription to remove
-**
-** \return None
-**
-**************************************************************************/
+int MQTT_AddSubscription(int instance, mqtt_subs_config_t *subscription);
 int MQTT_DeleteSubscription(int instance, int subinstance);
-
-/*********************************************************************//**
-** MQTT_ScheduleResubscription
-**
-**
-** \param sub - pointer to subscription to reconnect
-**
-** \return None
-**
-**************************************************************************/
-int MQTT_ScheduleResubscription(int instance, mqtt_subscription_t *subscription);
-
-
-/*********************************************************************//**
-** MQTT_UpdateAllSockSet
-**
-**
-** \param set - socket set to update
-**
-** \return None
-**
-**************************************************************************/
+int MQTT_ScheduleResubscription(int instance, mqtt_subs_config_t *new_sub);
 void MQTT_UpdateAllSockSet(socket_set_t *set);
-
-/*********************************************************************//**
-** MQTT_ProcessAllSocketActivity
-**
-**
-** \param set -socket set to process activity on
-**
-** \return None
-**
-**************************************************************************/
 void MQTT_ProcessAllSocketActivity(socket_set_t* set);
-
-
-/*********************************************************************//**
-** MQTT_InitConnParams
-**
-** Initialise the conn params with the default data
-**
-** \param params - pointer to connection parameters to initialise
-**
-** \return None
-**
-**************************************************************************/
 void MQTT_InitConnParams(mqtt_conn_params_t* params);
-
-
-/*********************************************************************//**
-** MQTT_DestroyConnParams
-**
-** Destroys all data within the params. Will not destroy the actual data
-** structure that holds the params.
-**
-** \param params - pointer to params to free the internal data from
-**
-** \return None
-**
-**************************************************************************/
 void MQTT_DestroyConnParams(mqtt_conn_params_t* params);
-
-
-/*********************************************************************//**
-** MQTT_SubscriptionReplace
-**
-**
-** \param dest - pointer where the data should be copied into
-** \param src - pointer where the data comes from
-**
-** \return None
-**
-**************************************************************************/
-void MQTT_SubscriptionReplace(mqtt_subscription_t *dest, mqtt_subscription_t *src);
-
-
-/*********************************************************************//**
-** MQTT_SubscriptionDestroy
-**
-** Destroys the contents of a subscription struct. Does not destroy the actual
-** struct.
-**
-** \param sub - pointer to subscription items to destroy the contents of
-**
-** \return None
-**
-**************************************************************************/
-void MQTT_SubscriptionDestroy(mqtt_subscription_t *sub);
+int MQTT_GetAgentResponseTopicDiscovered(int instance, char *buf, int len);
+void MQTT_AllowConnect(void);
 
 #endif

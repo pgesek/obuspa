@@ -1,8 +1,8 @@
 /*
  *
- * Copyright (C) 2019-2021, Broadband Forum
+ * Copyright (C) 2019-2024, Broadband Forum
  * Copyright (C) 2020-2021, BT PLC
- * Copyright (C) 2021  CommScope, Inc
+ * Copyright (C) 2021-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -58,7 +58,7 @@
 typedef struct
 {
     mqtt_conn_params_t conn_params;
-    mqtt_subscription_t subscriptions[MAX_MQTT_SUBSCRIPTIONS];
+    mqtt_subs_config_t subscriptions[MAX_MQTT_SUBSCRIPTIONS];
 } client_t;
 
 
@@ -108,29 +108,7 @@ int NotifyChange_MQTTTransportProtocol(dm_req_t *req, char *value);
 int NotifyChange_MQTTCleanSession(dm_req_t *req, char *value);
 int NotifyChange_MQTTCleanStart(dm_req_t *req, char *value);
 int NotifyChange_MQTTRequestResponseInfo(dm_req_t *req, char *value);
-int NotifyChange_MQTTRequestProblemInfo(dm_req_t *req, char *value);
-#if 0
-// TODO: Removed as these are not yet used
-int NotifyChange_MQTTSessionExpiryInterval(dm_req_t *req, char *value);
-int NotifyChange_MQTTReceiveMaximum(dm_req_t *req, char *value);
-int NotifyChange_MQTTMaximumPacketSize(dm_req_t *req, char *value);
-int Validate_MQTTTopicAliasMaximum(dm_req_t *req, char *value);
-int NotifyChange_MQTTTopicAliasMaximum(dm_req_t *req, char *value);
-int NotifyChange_MQTTWillEnable(dm_req_t *req, char *value);
-int Validate_MQTTWillQoS(dm_req_t *req, char *value);
-int NotifyChange_MQTTWillQoS(dm_req_t *req, char *value);
-int NotifyChange_MQTTWillRetain(dm_req_t *req, char *value);
-int NotifyChange_MQTTWillDelayInterval(dm_req_t *req, char *value);
-int NotifyChange_MQTTWillMessageExpiryInterval(dm_req_t *req, char *value);
-int NotifyChange_MQTTWillContentType(dm_req_t *req, char *value);
-int NotifyChange_MQTTWillResponseTopic(dm_req_t *req, char *value);
-int NotifyChange_MQTTWillTopic(dm_req_t *req, char *value);
-int NotifyChange_MQTTTWillValue(dm_req_t *req, char *value);
-int NotifyChange_MQTTPublishMessageExpiryInterval(dm_req_t *req, char *value);
-int Validate_MQTTMessageRetryTime(dm_req_t *req, char *value);
-int NotifyChange_MQTTMessageRetryTime(dm_req_t *req, char *value);
-int NotifyChange_MQTTAuthenticationMethod(dm_req_t *req, char *value);
-#endif
+int Get_MqttResponseInformation(dm_req_t *req, char *buf, int len);
 int Validate_MQTTConnectRetryTime(dm_req_t *req, char *value);
 int NotifyChange_MQTTConnectRetryTime(dm_req_t *req, char *value);
 int Validate_MQTTConnectRetryIntervalMultiplier(dm_req_t *req, char *value);
@@ -138,30 +116,36 @@ int NotifyChange_MQTTConnectRetryIntervalMultiplier(dm_req_t *req, char *value);
 int Validate_MQTTConnectRetryMaxInterval(dm_req_t *req, char *value);
 int NotifyChange_MQTTConnectRetryMaxInterval(dm_req_t *req, char *value);
 int Get_MqttClientStatus(dm_req_t *req, char *buf, int len);
+int AutoPopulate_MqttName(dm_req_t *req, char *buf, int len);
+int Validate_MqttName(dm_req_t *req, char *value);
+int NotifyChange_MQTT_ALPN(dm_req_t *req, char *value);
 
 /*MQTT Subscriptions*/
 int ValidateAdd_MqttClientSubscriptions(dm_req_t *req);
 int Notify_MqttClientSubcriptionsAdded(dm_req_t *req);
 int Notify_MqttClientSubscriptionsDeleted(dm_req_t *req);
+int Validate_MQTTSubscriptionEnable(dm_req_t *req, char *value);
 int NotifyChange_MQTTSubscriptionEnable(dm_req_t *req, char *value);
 int NotifyChange_MQTTSubscriptionTopic(dm_req_t *req, char *value);
 int Validate_MQTTSubscriptionQoS(dm_req_t *req, char *value);
 int NotifyChange_MQTTSubscriptionQoS(dm_req_t *req, char *value);
+int Validate_MQTTSubscriptionTopic(dm_req_t *req, char *value);
 
 mqtt_conn_params_t *FindMqttParamsByInstance(int instance);
 mqtt_conn_params_t *FindUnusedMqttParams(void);
-mqtt_subscription_t* FindUnusedSubscriptionInMqttClient(client_t* client);
+mqtt_subs_config_t* FindUnusedSubscriptionInMqttClient(client_t* client);
 client_t *FindUnusedMqttClient(void);
 client_t *FindDevMqttClientByInstance(int instance);
 void DestroyMQTTClient(client_t *client);
 int ProcessMqttClientAdded(int instance);
-int ProcessMqttSubscriptionAdded(int instance, int sub_instance);
+int ProcessMqttSubscriptionAdded(int instance, int sub_instance, mqtt_subs_config_t **mqtt_sub);
 int DEVICE_MQTT_StartAllClients(void);
-int EnableMQTTClient(mqtt_conn_params_t *mp, mqtt_subscription_t subscriptions[MAX_MQTT_SUBSCRIPTIONS]);
+int EnableMQTTClient(client_t *mqttclient);
 void ScheduleMqttReconnect(mqtt_conn_params_t *mp);
-void ScheduleMQTTResubscribe(client_t *mqttclient, mqtt_subscription_t *sub);
+void ScheduleMQTTResubscribe(client_t *mqttclient, mqtt_subs_config_t *sub);
 int ClientNumberOfEntries(void);
 int SubscriptionNumberofEntries(int instance);
+int Operate_MQTTForceReconnect(dm_req_t *req, char *command_key, kv_vector_t *input_args, kv_vector_t *output_args);
 
 /*********************************************************************//**
 **
@@ -179,7 +163,7 @@ int DEVICE_MQTT_Init(void)
     int err = USP_ERR_OK;
     int i, j;
     mqtt_conn_params_t *mp;
-    mqtt_subscription_t *subs;
+    mqtt_subs_config_t *subs;
 
     // Exit if unable to initialise the lower level MQTT component
     err = MQTT_Init();
@@ -199,17 +183,20 @@ int DEVICE_MQTT_Init(void)
         for (j=0; j<MAX_MQTT_SUBSCRIPTIONS; j++)
         {
             subs = &mqtt_client_params[i].subscriptions[j];
-            subs->state = kMqttSubState_Unsubscribed;
             subs->instance = INVALID;
         }
     }
 
     // Register parameters implemented by this component
+    err |= USP_REGISTER_Param_SupportedList("Device.MQTT.Capabilities.ProtocolVersionsSupported", mqtt_protocolver, NUM_ELEM(mqtt_protocolver));
+    err |= USP_REGISTER_Param_SupportedList("Device.MQTT.Capabilities.TransportProtocolSupported", mqtt_tsprotocol, NUM_ELEM(mqtt_tsprotocol));
+    err |= USP_REGISTER_Param_Constant("Device.MQTT.Capabilities.MaxNumberOfClientSubscriptions", TO_STR(MAX_MQTT_SUBSCRIPTIONS), DM_UINT);
+
     err |= USP_REGISTER_Object(DEVICE_MQTT_CLIENT ".{i}", ValidateAdd_Mqttclients, NULL,
                                Notify_MQTTClientAdded, NULL, NULL, Notify_MqttClientDeleted);
     if (err != USP_ERR_OK)
     {
-        USP_LOG_Error("MQTT object registration failed\n");
+        USP_LOG_Error("MQTT object registration failed");
         return err;
     }
 
@@ -223,46 +210,32 @@ int DEVICE_MQTT_Init(void)
     err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.KeepAliveTime", "60",  Validate_MQTTKeepAliveTime, NotifyChange_MQTTKeepAliveTime, DM_UINT);
     err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.ProtocolVersion", "5.0", Validate_MQTTProtocolVersion, NotifyChange_MQTTProtocolVersion , DM_STRING);
     err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.ClientID", "", NULL, NotifyChange_MQTTClientId, DM_STRING);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.Name", NULL, NULL, NotifyChange_MQTTName , DM_STRING);
+    err |= USP_REGISTER_DBParam_ReadWriteAuto(DEVICE_MQTT_CLIENT ".{i}.Name", AutoPopulate_MqttName, Validate_MqttName, NotifyChange_MQTTName, DM_STRING);
     err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.TransportProtocol", "TCP/IP", Validate_MQTTTransportProtocol, NotifyChange_MQTTTransportProtocol , DM_STRING);
     err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.CleanSession", "true", NULL, NotifyChange_MQTTCleanSession , DM_BOOL);
     err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.CleanStart", "true", NULL, NotifyChange_MQTTCleanStart , DM_BOOL);
     err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.RequestResponseInfo", "false", NULL, NotifyChange_MQTTRequestResponseInfo , DM_BOOL);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.RequestProblemInfo", "false", NULL, NotifyChange_MQTTRequestProblemInfo , DM_BOOL);
-#if 0
-    // TODO: Removed as these are not yet used
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.SessionExpiryInterval", NULL, NULL, NotifyChange_MQTTSessionExpiryInterval, DM_UINT);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.ReceiveMaximum", NULL, NULL, NotifyChange_MQTTReceiveMaximum, DM_UINT);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.MaximumPacketSize", NULL, NULL, NotifyChange_MQTTMaximumPacketSize, DM_UINT);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.TopicAliasMaximum", NULL, Validate_MQTTTopicAliasMaximum, NotifyChange_MQTTTopicAliasMaximum, DM_UINT);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.WillEnable", "false", NULL, NotifyChange_MQTTWillEnable , DM_BOOL);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.WillQoS", NULL, Validate_MQTTWillQoS, NotifyChange_MQTTWillQoS, DM_UINT);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.WillRetain", "false", NULL, NotifyChange_MQTTWillRetain , DM_BOOL);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.WillDelayInterval", NULL, NULL, NotifyChange_MQTTWillDelayInterval, DM_UINT);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.WillMessageExpiryInterval", NULL, NULL, NotifyChange_MQTTWillMessageExpiryInterval, DM_UINT);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.WillContentType", NULL, NULL, NotifyChange_MQTTWillContentType , DM_STRING);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.WillResponseTopic", NULL, NULL, NotifyChange_MQTTWillResponseTopic , DM_STRING);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.WillTopic", NULL, NULL, NotifyChange_MQTTWillTopic , DM_STRING);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.WillValue", NULL, NULL, NotifyChange_MQTTTWillValue , DM_STRING);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.AuthenticationMethod", NULL, NULL, NotifyChange_MQTTAuthenticationMethod , DM_STRING);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.MessageRetryTime", "5", Validate_MQTTMessageRetryTime, NotifyChange_MQTTMessageRetryTime , DM_UINT);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.PublishMessageExpiryInterval", NULL, NULL, NotifyChange_MQTTPublishMessageExpiryInterval , DM_UINT);
-#endif
+    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.ALPN", "", DEVICE_SECURITY_ValidateALPN, NotifyChange_MQTT_ALPN , DM_STRING);
 
     err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.ConnectRetryTime", "5", Validate_MQTTConnectRetryTime, NotifyChange_MQTTConnectRetryTime , DM_UINT);
     err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.ConnectRetryIntervalMultiplier", "2000", Validate_MQTTConnectRetryIntervalMultiplier, NotifyChange_MQTTConnectRetryIntervalMultiplier , DM_UINT);
     err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.ConnectRetryMaxInterval", "30720", Validate_MQTTConnectRetryMaxInterval, NotifyChange_MQTTConnectRetryMaxInterval , DM_UINT);
 
-    err |= USP_REGISTER_DBParam_ReadOnly(DEVICE_MQTT_CLIENT ".{i}.ResponseInformation", "", DM_STRING);
+    err |= USP_REGISTER_VendorParam_ReadOnly(DEVICE_MQTT_CLIENT ".{i}.ResponseInformation", Get_MqttResponseInformation, DM_STRING);
     err |= USP_REGISTER_VendorParam_ReadOnly(DEVICE_MQTT_CLIENT ".{i}.Status", Get_MqttClientStatus, DM_STRING);
 
     err |= USP_REGISTER_Object(DEVICE_MQTT_CLIENT ".{i}.Subscription.{i}.", ValidateAdd_MqttClientSubscriptions, NULL, Notify_MqttClientSubcriptionsAdded,
                                                               NULL, NULL, Notify_MqttClientSubscriptionsDeleted);
     err |= USP_REGISTER_Param_NumEntries(DEVICE_MQTT_CLIENT ".{i}.SubscriptionNumberOfEntries", DEVICE_MQTT_CLIENT".{i}.Subscription.{i}");
     err |= USP_REGISTER_DBParam_Alias(DEVICE_MQTT_CLIENT ".{i}.Subscription.{i}.Alias", NULL);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.Subscription.{i}.Enable", "false", NULL, NotifyChange_MQTTSubscriptionEnable, DM_BOOL);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.Subscription.{i}.Topic", NULL, NULL, NotifyChange_MQTTSubscriptionTopic, DM_STRING);
-    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.Subscription.{i}.QoS", NULL, Validate_MQTTSubscriptionQoS, NotifyChange_MQTTSubscriptionQoS, DM_UINT);
+    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.Subscription.{i}.Enable", "false", Validate_MQTTSubscriptionEnable, NotifyChange_MQTTSubscriptionEnable, DM_BOOL);
+    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.Subscription.{i}.Topic", NULL, Validate_MQTTSubscriptionTopic, NotifyChange_MQTTSubscriptionTopic, DM_STRING);
+    err |= USP_REGISTER_DBParam_ReadWrite(DEVICE_MQTT_CLIENT ".{i}.Subscription.{i}.QoS", TO_STR(MQTT_FALLBACK_QOS), Validate_MQTTSubscriptionQoS, NotifyChange_MQTTSubscriptionQoS, DM_UINT);
+
+    char *name_unique_keys[] = { "Name" };
+    err |= USP_REGISTER_Object_UniqueKey(DEVICE_MQTT_CLIENT ".{i}", name_unique_keys, NUM_ELEM(name_unique_keys));
+
+    err |= USP_REGISTER_SyncOperation(DEVICE_MQTT_CLIENT ".{i}.ForceReconnect()", Operate_MQTTForceReconnect);
 
     // Exit if any errors occurred
     if (err != USP_ERR_OK)
@@ -300,14 +273,6 @@ int DEVICE_MQTT_Start(void)
     {
         USP_LOG_Error("%s: Unable to start Device MQTT", __FUNCTION__);
         return err;
-    }
-
-    // Exit, issuing a warning, if no MQTT clients are present in database
-    if (iv.num_entries == 0)
-    {
-        USP_LOG_Warning("%s: WARNING: No instances in %s", __FUNCTION__, DEVICE_MQTT_CLIENT);
-        err = USP_ERR_OK;
-        goto exit;
     }
 
     // Add all MQTT clients to the MQTT client array
@@ -363,8 +328,7 @@ void DEVICE_MQTT_Stop(void)
         DestroyMQTTClient(&mqtt_client_params[i]);
     }
 
-    // Delete all the clients and mosquitto in the core
-    MQTT_Destroy();
+    // NOTE: No need to call MQTT_Destroy() from here, as the MQTT MTP thread will already have been destroyed before this function is called
 }
 
 /*********************************************************************//**
@@ -380,19 +344,19 @@ void DEVICE_MQTT_Stop(void)
 **************************************************************************/
 int DEVICE_MQTT_StartAllClients(void)
 {
-    int i;
     client_t *mqttclient;
     int err;
+    int i;
 
     // Iterate over all MQTT clients, starting the ones that are enabled
-    for (i=0; i<ClientNumberOfEntries(); i++)
+    for (i = 0; i<MAX_MQTT_CLIENTS; i++)
     {
         mqttclient = &mqtt_client_params[i];
 
         if ((mqttclient->conn_params.instance != INVALID) && (mqttclient->conn_params.enable == true))
         {
             // Exit if no free slots to enable the connection. (Enable is successful, even if the connection is trying to reconnect)
-            err = EnableMQTTClient(&mqttclient->conn_params, mqttclient->subscriptions);
+            err = EnableMQTTClient(mqttclient);
             if (err != USP_ERR_OK)
             {
                 return err;
@@ -433,44 +397,55 @@ void DEVICE_MQTT_ScheduleReconnect(int instance)
 
 /*********************************************************************//**
 **
-** Get_MqttClientStatus
+** DEVICE_MQTT_UpdateClientId
 **
-** Gets the value of Device.MQTT.Client.{i}.Status
+** Called to update the ClientID saved in Device.MQTT.Client.{i}.ClientID
+** This may occur for MQTTv5 connections whose ClientID is assigned by the MQTT Broker in the CONNACK. See R-MQTT.9)
 **
-** \param   req - pointer to structure identifying the path
-** \param   buf - pointer to buffer into which to return the value of the parameter (as a textual string)
-** \param   len - length of buffer in which to return the value of the parameter
+** \param   instance - instance number of the connection in Device.MQTT.Client.{i}
+** \param   client_id - instance - instance number of the connection in Device.MQTT.Client.{i}
 **
-** \return  USP_ERR_OK if successful
+** \return  None
 **
 **************************************************************************/
-int Get_MqttClientStatus(dm_req_t *req, char *buf, int len)
+void DEVICE_MQTT_UpdateClientId(int instance, char *client_id)
 {
-    mqtt_conn_params_t* conn_params;
-    const char *status;
+    int err;
+    mqtt_conn_params_t *mp;
+    char path[MAX_DM_PATH];
+    dm_trans_vector_t trans;
 
-    // Determine stomp connection to be read
-    conn_params = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(conn_params != NULL);
-
-    if (conn_params->enable == false)
+    // Exit if unable to determine mqtt client to be updated
+    mp = FindMqttParamsByInstance(instance);
+    if (mp == NULL)
     {
-        status = "Disabled";
-    }
-    else
-    {
-        status = MQTT_GetClientStatus(conn_params->instance);
+        return;
     }
 
-    USP_STRNCPY(buf, status, len);
-    return USP_ERR_OK;
+    // Exit if client_id hasn't changed
+    if (strcmp(mp->client_id, client_id) == 0)
+    {
+        return;
+    }
+
+    // Set the new value persistently in the USP DB
+    err = DM_TRANS_Start(&trans);
+    if (err == USP_ERR_OK)
+    {
+        USP_SNPRINTF(path, sizeof(path), "Device.MQTT.Client.%d.ClientID", instance);
+        DATA_MODEL_SetParameterValue(path, client_id, 0);
+
+        // The commit will cascade to update our local copy
+        DM_TRANS_Commit();
+    }
 }
 
 /*********************************************************************//**
 **
 ** DEVICE_MQTT_GetMtpStatus
 **
-** Function called to get the value of Device.LocalAgent.MTP.{i}.Status for a MTPP client**
+** Function called to get the value of Device.LocalAgent.MTP.{i}.Status for an MQTT client
+**
 ** \param   instance - instance number of the connection in Device.MQTT.Client.{i}
 **
 ** \return  Status of the MQTT client
@@ -524,66 +499,88 @@ int DEVICE_MQTT_CountEnabledConnections(void)
 
 /*********************************************************************//**
 **
-** DEVICE_MQTT_QueueBinaryMessage
+** DEVICE_MQTT_UpdateControllerTopics
 **
-** Function called to queue a message on the specified MQTT connection
+** Called to update all MTP clients with the set of Controllers connected to them
+** (in order that USP Connect/Disconnect records can be sent to the Controllers)
+** This function is called whenever there are changes to Controller MTP parameters
 **
-** \param   usp_msg_type - Type of USP message contained in pbuf. This is used for debug logging when the message is sent by the MTP.
-** \param   instance - instance number of the MQTT connection in Device.MQTT.Client.{i}
-** \param   topic - MQTT client subscribed topic
-** \param   pbuf - pointer to buffer containing binary protobuf message. Ownership of this buffer passes to this code, if successful
-** \param   pbuf_len - length of buffer containing protobuf binary message
+** \param   req - pointer to structure identifying the path
+** \param   buf - pointer to buffer into which to return the value of the parameter (as a textual string)
+** \param   len - length of buffer in which to return the value of the parameter
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int DEVICE_MQTT_QueueBinaryMessage(Usp__Header__MsgType usp_msg_type, int instance, char *topic, char *response_topic, unsigned char *pbuf, int pbuf_len)
+void DEVICE_MQTT_UpdateControllerTopics(void)
 {
+    int i;
+    kv_vector_t controller_topics;
     mqtt_conn_params_t *mp;
 
-    // Exit if unable to find the specified MQTT client
-    mp = FindMqttParamsByInstance(instance);
-    if ((mp == NULL) || (mp->enable == false))
+    // Iterate over all MQTT connections, updating which controllers are connected to them
+    for (i=0; i<NUM_ELEM(mqtt_client_params); i++)
     {
-        USP_ERR_SetMessage("%s: No internal MQTT connection matching Device.MQTT.Client.%d", __FUNCTION__, instance);
-        return USP_ERR_INTERNAL_ERROR;
+        mp = &mqtt_client_params[i].conn_params;
+        if ((mp->instance != INVALID) && (mp->enable))
+        {
+            DEVICE_CONTROLLER_GetMqttControllerTopics(mp->instance, &controller_topics);
+            MQTT_ModifyConnectedControllers(mp->instance, &controller_topics); // NOTE: ownership of controller_topics passes to MQTT MTP if it contains anything
+        }
+    }
+}
+
+/*********************************************************************//**
+**
+** Get_MqttClientStatus
+**
+** Gets the value of Device.MQTT.Client.{i}.Status
+**
+** \param   req - pointer to structure identifying the path
+** \param   buf - pointer to buffer into which to return the value of the parameter (as a textual string)
+** \param   len - length of buffer in which to return the value of the parameter
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int Get_MqttClientStatus(dm_req_t *req, char *buf, int len)
+{
+    mqtt_conn_params_t* conn_params;
+    const char *status;
+
+    // Determine MQTT connection to be read
+    conn_params = FindMqttParamsByInstance(inst1);
+    USP_ASSERT(conn_params != NULL);
+
+    if (conn_params->enable == false)
+    {
+        status = "Disabled";
+    }
+    else
+    {
+        status = MQTT_GetClientStatus(conn_params->instance);
     }
 
-    if (MQTT_QueueBinaryMessage(usp_msg_type, instance, topic, pbuf, pbuf_len) != USP_ERR_OK)
-    {
-        USP_ERR_SetMessage("%s: No internal MQTT Queue Binary message for topic %s", __FUNCTION__, topic);
-        return USP_ERR_INTERNAL_ERROR;
-    }
-
+    USP_STRNCPY(buf, status, len);
     return USP_ERR_OK;
 }
 
-int ClientNumberOfEntries(void)
+/*********************************************************************//**
+**
+** Get_MqttResponseInformation
+**
+** Gets the value of Device.MQTT.Client.{i}.ResponseInformation
+**
+** \param   req - pointer to structure identifying the path
+** \param   buf - pointer to buffer into which to return the value of the parameter (as a textual string)
+** \param   len - length of buffer in which to return the value of the parameter
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int Get_MqttResponseInformation(dm_req_t *req, char *buf, int len)
 {
-    int clientnumofentries, err;
-    err = DM_ACCESS_GetInteger("Device.MQTT.ClientNumberOfEntries", &clientnumofentries);
-    if (err != USP_ERR_OK)
-    {
-        USP_ERR_SetMessage("%s: Client number of entries failed", __FUNCTION__);
-        return -1;
-    }
-    return clientnumofentries;
-
-}
-
-int SubscriptionNumberofEntries(int instance)
-{
-    int subsnumofentries, err;
-    char path[MAX_DM_PATH];
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.SubscriptionNumberOfEntries", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetInteger(path, &subsnumofentries);
-    if (err != USP_ERR_OK)
-    {
-        USP_ERR_SetMessage("%s: Subscription number of entries failed", __FUNCTION__);
-        return -1;
-    }
-
-    return subsnumofentries;
+    return MQTT_GetAgentResponseTopicDiscovered(inst1, buf, len);
 }
 
 /*********************************************************************//**
@@ -601,10 +598,17 @@ int ProcessMqttClientAdded(int instance)
 {
     int err;
     char path[MAX_DM_PATH];
-
+    int_vector_t iv;
     client_t *mqttclient;
-    mqttclient = FindUnusedMqttClient();
+    int i;
+    int mqtt_subs_inst;
+    char buf[MAX_DM_SHORT_VALUE_LEN];
+    dm_vendor_get_mtp_username_cb_t   get_mtp_username_cb;
+    dm_vendor_get_mtp_password_cb_t   get_mtp_password_cb;
+
     // Initialise to defaults
+    INT_VECTOR_Init(&iv);
+    mqttclient = FindUnusedMqttClient();
     if (mqttclient == NULL)
     {
         return USP_ERR_RESOURCES_EXCEEDED;
@@ -659,12 +663,50 @@ int ProcessMqttClientAdded(int instance)
         goto exit;
     }
 
+    // Override a blank username in the database with that provided by a core vendor hook
+    if (mqttclient->conn_params.username[0] == '\0')
+    {
+        get_mtp_username_cb = vendor_hook_callbacks.get_mtp_username_cb;
+        if (get_mtp_username_cb != NULL)
+        {
+            // Exit if vendor hook failed
+            err = get_mtp_username_cb(instance, buf, sizeof(buf));
+            if (err != USP_ERR_OK)
+            {
+                goto exit;
+            }
+
+            // Replace the blank password from the database with the password retrieved via core vendor hook
+            USP_SAFE_FREE(mqttclient->conn_params.username);
+            mqttclient->conn_params.username = USP_STRDUP(buf);
+        }
+    }
+
     // Exit if unable to get the password for this MQTT client
     USP_SNPRINTF(path, sizeof(path), "%s.%d.Password", device_mqtt_client_root, instance);
     err = DM_ACCESS_GetPassword(path, &mqttclient->conn_params.password);
     if (err != USP_ERR_OK)
     {
         goto exit;
+    }
+
+    // Override a blank password in the database with that provided by a core vendor hook
+    if (mqttclient->conn_params.password[0] == '\0')
+    {
+        get_mtp_password_cb = vendor_hook_callbacks.get_mtp_password_cb;
+        if (get_mtp_password_cb != NULL)
+        {
+            // Exit if vendor hook failed
+            err = get_mtp_password_cb(instance, buf, sizeof(buf));
+            if (err != USP_ERR_OK)
+            {
+                goto exit;
+            }
+
+            // Replace the blank password from the database with the password retrieved via core vendor hook
+            USP_SAFE_FREE(mqttclient->conn_params.password);
+            mqttclient->conn_params.password = USP_STRDUP(buf);
+        }
     }
 
     // Exit if unable to get the clientid for this MQTT client
@@ -678,6 +720,14 @@ int ProcessMqttClientAdded(int instance)
     // Exit if unable to get the name for this MQTT client
     USP_SNPRINTF(path, sizeof(path), "%s.%d.Name", device_mqtt_client_root, instance);
     err = DM_ACCESS_GetString(path, &mqttclient->conn_params.name);
+    if (err != USP_ERR_OK)
+    {
+        goto exit;
+    }
+
+    // Exit if unable to get the ALPN options for this MQTT client
+    USP_SNPRINTF(path, sizeof(path), "%s.%d.ALPN", device_mqtt_client_root, instance);
+    err = DM_ACCESS_GetString(path, &mqttclient->conn_params.alpn);
     if (err != USP_ERR_OK)
     {
         goto exit;
@@ -715,14 +765,6 @@ int ProcessMqttClientAdded(int instance)
         goto exit;
     }
 
-    // Exit if unable to get the RequestProblemInfo for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.RequestProblemInfo", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetBool(path, &mqttclient->conn_params.request_problem_info);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
     // Exit if unable to get the Response Information for this MQTT client
     USP_SNPRINTF(path, sizeof(path), "%s.%d.ResponseInformation", device_mqtt_client_root, instance);
     USP_SAFE_FREE(mqttclient->conn_params.response_information);
@@ -731,139 +773,6 @@ int ProcessMqttClientAdded(int instance)
     {
         goto exit;
     }
-
-#if 0
-    // TODO: Removed as these are not yet used
-    // Exit if unable to get the SessionExpiryInterval for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.SessionExpiryInterval", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetUnsigned(path, &mqttclient->conn_params.session_expiry);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-    // Exit if unable to get the ReceiveMaximum for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.ReceiveMaximum", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetUnsigned(path, &mqttclient->conn_params.receive_max);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-    // Exit if unable to get the MaximumPacketSize for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.MaximumPacketSize", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetUnsigned(path, &mqttclient->conn_params.max_packet_size);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-    // Exit if unable to get the TopicAliasMaximum for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.TopicAliasMaximum", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetUnsigned(path, &mqttclient->conn_params.topic_alias_max);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-    // Exit if unable to get the WillEnable for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.WillEnable", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetBool(path, &mqttclient->conn_params.will_enable);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-    // Exit if unable to get the WillQoS for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.WillQoS", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetUnsigned(path, &mqttclient->conn_params.will_qos);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-    // Exit if unable to get the WillRetain for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.WillRetain", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetBool(path, &mqttclient->conn_params.will_retain);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-    // Exit if unable to get the WillDelayInterval for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.WillDelayInterval", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetUnsigned(path, &mqttclient->conn_params.will_delay_interval);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-    // Exit if unable to get the WillMessageExpiryInterval for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.WillMessageExpiryInterval", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetUnsigned(path, &mqttclient->conn_params.will_message_expiry);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-    // Exit if unable to get the WillContentType for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.WillContentType", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetString(path, &mqttclient->conn_params.will_content_type);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-    // Exit if unable to get the WillResponseTopic for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.WillResponseTopic", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetString(path, &mqttclient->conn_params.will_response_topic);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-    // Exit if unable to get the WillTopic for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.WillTopic", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetString(path, &mqttclient->conn_params.will_topic);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-    // Exit if unable to get the WillValue for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.WillValue", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetString(path, &mqttclient->conn_params.will_value);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-    // Exit if unable to get the Authentication Method for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.AuthenticationMethod", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetString(path, &mqttclient->conn_params.auth_method);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-    // Exit if unable to get the PublishMessageExpiryInterval for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.PublishMessageExpiryInterval", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetUnsigned(path, &mqttclient->conn_params.pubmsg_expinterval);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-    // Exit if unable to get the MessageRetryTime for this MQTT client
-    USP_SNPRINTF(path, sizeof(path), "%s.%d.MessageRetryTime", device_mqtt_client_root, instance);
-    err = DM_ACCESS_GetUnsigned(path, &mqttclient->conn_params.message_retrytime);
-    if (err != USP_ERR_OK)
-    {
-        goto exit;
-    }
-
-
-#endif
 
     // Exit if unable to get the ConnectRetryTime for this MQTT client
     USP_SNPRINTF(path, sizeof(path), "%s.%d.ConnectRetryTime", device_mqtt_client_root, instance);
@@ -889,10 +798,38 @@ int ProcessMqttClientAdded(int instance)
         goto exit;
     }
 
+    // Exit if unable to get the object instance numbers present in the mqtt client subscription table
+    USP_SNPRINTF(path, sizeof(path), "%s.%d.Subscription.", device_mqtt_client_root, instance);
+    err = DATA_MODEL_GetInstances(path, &iv);
+    if (err != USP_ERR_OK)
+    {
+        goto exit;
+    }
+
+    // Add all MQTT subscriptions
+    for (i=0; i < iv.num_entries; i++)
+    {
+        mqtt_subs_inst = iv.vector[i];
+        err = ProcessMqttSubscriptionAdded(instance, mqtt_subs_inst, NULL);
+        if (err != USP_ERR_OK)
+        {
+            // Exit if unable to delete a MQTT subscription with bad parameters from the DB
+            USP_SNPRINTF(path, sizeof(path), "%s.%d.Subscription.%d", device_mqtt_client_root, instance, mqtt_subs_inst);
+            USP_LOG_Warning("%s: Deleting %s as it contained invalid parameters.", __FUNCTION__, path);
+            err = DATA_MODEL_DeleteInstance(path, 0);
+            if (err != USP_ERR_OK)
+            {
+                goto exit;
+            }
+        }
+    }
+
     // If the code gets here, then we successfully retrieved all data about the MQTT client
     err = USP_ERR_OK;
 
 exit:
+    INT_VECTOR_Destroy(&iv);
+
     if (err != USP_ERR_OK)
     {
         DestroyMQTTClient(mqttclient);
@@ -904,24 +841,29 @@ exit:
 **
 ** EnableMQTTClient
 **
-** Wrapper function to enable a MQTT client with the current connection parameters
+** Wrapper function to start the specified MQTT client connecting
 **
-** \param   mp - MQTT connection parameters
+** \param   mqttclient - MQTT client parameters
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int EnableMQTTClient(mqtt_conn_params_t *mp, mqtt_subscription_t subscriptions[MAX_MQTT_SUBSCRIPTIONS])
+int EnableMQTTClient(client_t *mqttclient)
 {
     int err;
+    mqtt_conn_params_t *mp;
+    kv_vector_t controller_topics;
 
-    USP_SAFE_FREE(mp->topic);
+    // Update agent topic. NOTE: It could be NULL if Device.LocalAgent.MTP.{i}.MQTT.ResponseTopicConfigured is empty
+    mp = &mqttclient->conn_params;
     USP_SAFE_FREE(mp->response_topic);
-    mp->topic = USP_STRDUP(DEVICE_CONTROLLER_GetControllerTopic(mp->instance));
     mp->response_topic = USP_STRDUP(DEVICE_MTP_GetAgentMqttResponseTopic(mp->instance));
+    mp->publish_qos = DEVICE_MTP_GetAgentMqttPublishQos(mp->instance);
 
-    // Check the error condition
-    err = MQTT_EnableClient(mp, subscriptions);
+    // Exit if unable to start the MQTT client
+    // NOTE: Ownership of controller_topics passes to MQTT_EnableClient
+    DEVICE_CONTROLLER_GetMqttControllerTopics(mqttclient->conn_params.instance, &controller_topics);
+    err = MQTT_EnableClient(mp, mqttclient->subscriptions, &controller_topics);
     if (err != USP_ERR_OK)
     {
         USP_LOG_Error("%s MQTT failed to enable the client", __FUNCTION__);
@@ -935,64 +877,80 @@ int EnableMQTTClient(mqtt_conn_params_t *mp, mqtt_subscription_t subscriptions[M
 **
 ** ProcessMqttSubscriptionAdded
 *
-** Reads the parameters for the specified Mqtt Client subscriotion from the
-** database and processes them
+** Reads the parameters for the specified MQTT client subscription from the
+** database and caches them in the local mqtt_client_params[]
+** NOTE: Does not propagate the change to the underlying MTP (this must be performed by the caller by calling MQTT_AddSubscription)
 **
 ** \param   instance - instance number of the MQTT client
 ** \param   sub_instance - instance number of the MQTT Subscription
+** \param   mqtt_sub - pointer to variable in which to return a pointer to the MQTT subscription entry allocated by this function
+**                     NOTE: This parameter may be NULL, if the caller is not interested in this value
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ProcessMqttSubscriptionAdded(int instance, int sub_instance)
+int ProcessMqttSubscriptionAdded(int instance, int sub_instance, mqtt_subs_config_t **mqtt_sub)
 {
     int err = USP_ERR_OK;
     char path[MAX_DM_PATH];
     client_t *client = NULL;
+    mqtt_subs_config_t *sub;
 
-    // Refactor.
+    // Default return parameters
+    if (mqtt_sub != NULL)
+    {
+        *mqtt_sub = NULL;
+    }
+
+    // Exit if unable to allocate a subscription entry for this MQTT client
     client = FindDevMqttClientByInstance(instance);
     USP_ASSERT(client != NULL);
-
-    mqtt_subscription_t* sub = FindUnusedSubscriptionInMqttClient(client);
+    sub = FindUnusedSubscriptionInMqttClient(client);
     if (sub == NULL)
     {
         USP_LOG_Error("%s: Failed to find empty subscription.", __FUNCTION__);
         return USP_ERR_RESOURCES_EXCEEDED;
     }
 
-    sub->instance = sub_instance;
-
+    // Exit if unable to retrieve the Enable parameter for this MQTT subscription
     USP_SNPRINTF(path, sizeof(path), "%s.%d.Subscription.%d.Enable", device_mqtt_client_root, instance, sub_instance);
     err = DM_ACCESS_GetBool(path, &sub->enabled);
     if (err != USP_ERR_OK)
     {
-        USP_ERR_SetMessage("%s: Client Subscription %d enable failed", __FUNCTION__, sub_instance);
         return err;
     }
 
+    // Exit if unable to retrieve the Topic parameter for this MQTT subscription
     USP_SNPRINTF(path, sizeof(path), "%s.%d.Subscription.%d.Topic", device_mqtt_client_root, instance, sub_instance);
     USP_SAFE_FREE(sub->topic);
     err = DM_ACCESS_GetString(path, &sub->topic);
     if (err != USP_ERR_OK)
     {
-        USP_ERR_SetMessage("%s: Client Subscription %d Topic failed", __FUNCTION__, sub_instance);
         return err;
     }
 
+    // Exit if the subscription is enabled, but the topic is empty
+    USP_ASSERT(sub->topic != NULL);
+    if ((sub->enabled) && (sub->topic[0] == '\0'))
+    {
+        USP_LOG_Error("%s: Device.MQTT.Client.%d.Subscription.%d is enabled, but topic is empty", __FUNCTION__, instance, sub_instance);
+        USP_SAFE_FREE(sub->topic);
+        return USP_ERR_INVALID_ARGUMENTS;
+    }
+
+    // Exit if unable to retrieve the QoS parameter for this MQTT subscription
     USP_SNPRINTF(path, sizeof(path), "%s.%d.Subscription.%d.QoS", device_mqtt_client_root, instance, sub_instance);
     err = DM_ACCESS_GetUnsigned(path, &sub->qos);
     if (err != USP_ERR_OK)
     {
-        USP_ERR_SetMessage("%s: Client Subscription %d QoS failed", __FUNCTION__, sub_instance);
         return err;
     }
 
-    err = MQTT_AddSubscription(instance, sub);
-    if (err != USP_ERR_OK)
+    // Since the subscription was retrieved successfully, mark the subscription as 'in-use' and return the subscription entry
+    sub->instance = sub_instance;
+    if (mqtt_sub != NULL)
     {
-        USP_ERR_SetMessage("%s: client subscribe failed\n", __FUNCTION__);
-        return err;
+        *mqtt_sub = sub;
     }
 
     return err;
@@ -1000,9 +958,232 @@ int ProcessMqttSubscriptionAdded(int instance, int sub_instance)
 
 /*********************************************************************//**
 **
+** AutoPopulate_MqttName
+**
+** Called to get an auto-populated parameter value for the Device.MQTT.Client.{i}.Name parameter
+**
+** \param   req - pointer to structure identifying the path
+** \param   buf - pointer to buffer in which to store the value to use to auto-populate the parameter's value
+** \param   len - length of return buffer
+**
+** \return  USP_ERR_OK if auto assigned ID was unique
+**
+**************************************************************************/
+int AutoPopulate_MqttName(dm_req_t *req, char *buf, int len)
+{
+    int err;
+
+    USP_SNPRINTF(buf, len, "cpe-%d", inst1);
+    err = Validate_MqttName(req, buf);
+
+    return err;
+}
+
+/*********************************************************************//**
+**
+** Validate_MqttName
+**
+** Validates that the Name parameter being added is unique for the recipient
+**
+** \param   req - pointer to structure identifying the instance
+** \param   value - value that the controller would like to set the Name to
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int Validate_MqttName(dm_req_t *req, char *value)
+{
+    int i;
+    client_t *mqttclient;
+
+    // Exit if no value set for Name (i.e. set to an empty string)
+    if (*value == '\0')
+    {
+        USP_ERR_SetMessage("%s: Name must be set to a non-empty string", __FUNCTION__);
+        return USP_ERR_INVALID_ARGUMENTS;
+    }
+
+    // Iterate over all MQTT clients
+    for (i=0; i<MAX_MQTT_CLIENTS; i++)
+    {
+        // Skip if this is an unused slot
+        mqttclient = &mqtt_client_params[i];
+        if (mqttclient->conn_params.instance == INVALID)
+        {
+            continue;
+        }
+
+        // Exit if the instance already exists
+        if (mqttclient->conn_params.instance == inst1)
+        {
+            // Allow the new value if no value was previously set, or the new value is the same as the old value
+            if ((*(mqttclient->conn_params.name) == '\0') || (strcmp(mqttclient->conn_params.name, value) == 0))
+            {
+                return USP_ERR_OK;
+            }
+
+            // Otherwise, the new value is different, so don't allow it
+            USP_ERR_SetMessage("%s: Name cannot be changed from '%s'", __FUNCTION__, mqttclient->conn_params.name);
+            return USP_ERR_INVALID_VALUE;
+        }
+
+
+        // Exit if this entry matches the value that the controller is trying to set
+        if (strcmp(mqttclient->conn_params.name, value)==0)
+        {
+            USP_ERR_SetMessage("%s: Name (%s) is already in use by %s.%d", __FUNCTION__, value, device_mqtt_client_root, mqttclient->conn_params.instance);
+            return USP_ERR_INVALID_VALUE;
+        }
+    }
+
+    // If the code gets here, then the new Subscription ID value is unique for this controller
+    return USP_ERR_OK;
+}
+
+/*********************************************************************//**
+**
+** Validate_MQTTBrokerPort
+**
+** Validates Device.MQTT.Client.{i}.BrokerPort by checking if valid number
+**
+** \param   req - pointer to structure identifying the parameter
+** \param   value - value that the controller would like to set the parameter to
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int Validate_MQTTBrokerPort(dm_req_t *req, char *value)
+{
+    return DM_ACCESS_ValidateRange_Unsigned(req, 1, 65535);
+}
+
+/*********************************************************************//**
+**
+** Validate_MQTTKeepAliveTime
+**
+** Validates Device.MQTT.Client.{i}.KeepAliveTime by checking if valid number
+**
+** \param   req - pointer to structure identifying the parameter
+** \param   value - value that the controller would like to set the parameter to
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int Validate_MQTTKeepAliveTime(dm_req_t *req, char *value)
+{
+    return DM_ACCESS_ValidateRange_Unsigned(req, 0, 65535);
+}
+
+/*********************************************************************//**
+**
+** Validate_MQTTProtocolVersion
+**
+** Validates Device.MQTT.Client.{i}.ProtocolVersion
+** by checking that it matches the mqtt protocol version we support
+**
+** \param   req - pointer to structure identifying the parameter
+** \param   value - value that the controller would like to set the parameter to
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int Validate_MQTTProtocolVersion(dm_req_t *req, char *value)
+{
+    mqtt_protocolver_t protocol;
+
+    // Exit if the protocol was invalid
+    protocol = TEXT_UTILS_StringToEnum(value, mqtt_protocolver, NUM_ELEM(mqtt_protocolver));
+    if (protocol == INVALID)
+    {
+        USP_ERR_SetMessage("%s: Invalid or unsupported protocol %s", __FUNCTION__, value);
+        return USP_ERR_INVALID_VALUE;
+    }
+    return USP_ERR_OK;
+}
+
+/*********************************************************************//**
+**
+** Validate_MQTTTransportProtocol
+**
+** Validates Device.MQTT.Client.{i}.TransportProtocol
+** by checking that it matches the mqtt Transport protocol we support
+**
+** \param   req - pointer to structure identifying the parameter
+** \param   value - value that the controller would like to set the parameter to
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int Validate_MQTTTransportProtocol(dm_req_t *req, char *value)
+{
+    mqtt_tsprotocol_t tsprotocol;
+
+    // Exit if the protocol was invalid
+    tsprotocol = TEXT_UTILS_StringToEnum(value, mqtt_tsprotocol, NUM_ELEM(mqtt_tsprotocol));
+    if (tsprotocol == INVALID)
+    {
+        USP_ERR_SetMessage("%s: Invalid or unsupported transport protocol %s", __FUNCTION__, value);
+        return USP_ERR_INVALID_VALUE;
+    }
+    return USP_ERR_OK;
+}
+
+/*********************************************************************//**
+**
+** Validate_MQTTConnectRetryTime
+**
+** Validates Device.MQTT.Client.{i}.ConnectRetryTime by checking if valid number
+**
+** \param   req - pointer to structure identifying the parameter
+** \param   value - value that the controller would like to set the parameter to
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int Validate_MQTTConnectRetryTime(dm_req_t *req, char *value)
+{
+    return DM_ACCESS_ValidateRange_Unsigned(req, 1, 65535);
+}
+
+/*********************************************************************//**
+**
+** Validate_MQTTConnectRetryIntervalMultiplier
+**
+** Validates Device.MQTT.Client.{i}.ConnectRetryIntervalMultiplier by checking if valid number
+**
+** \param   req - pointer to structure identifying the parameter
+** \param   value - value that the controller would like to set the parameter to
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int Validate_MQTTConnectRetryIntervalMultiplier(dm_req_t *req, char *value)
+{
+    return DM_ACCESS_ValidateRange_Unsigned(req, 1000, 65535);
+}
+
+/*********************************************************************//**
+**
+** Validate_MQTTConnectRetryMaxInterval
+**
+** Validates Device.MQTT.Client.{i}.ConnectRetryMaxInterval by checking if valid number
+**
+** \param   req - pointer to structure identifying the parameter
+** \param   value - value that the controller would like to set the parameter to
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int Validate_MQTTConnectRetryMaxInterval(dm_req_t *req, char *value)
+{
+    return DM_ACCESS_ValidateRange_Unsigned(req, 1, 65535);
+}
+
+/*********************************************************************//**
+**
 ** NotifyChange_MQTTEnable
 **
-** Function called when Device.MQTT.Connection.{i}.Enable is modified
+** Function called when Device.MQTT.Client.{i}.Enable is modified
 **
 ** \param   req - pointer to structure identifying the path
 ** \param   value - new value of this parameter
@@ -1026,7 +1207,7 @@ int NotifyChange_MQTTEnable(dm_req_t *req, char *value)
     // However, as it is unlikely to be the case that a controller would ever do this, I have not added extra code to support this
     if ((old_value == true) && (val_bool == false))
     {
-        MQTT_DisableClient(mqttclient->conn_params.instance, true);
+        MQTT_DisableClient(mqttclient->conn_params.instance);
     }
 
     // Set the new value, we do this inbetween stopping and starting the connection because both must have the enable set to true
@@ -1036,7 +1217,7 @@ int NotifyChange_MQTTEnable(dm_req_t *req, char *value)
     if ((old_value == false) && (val_bool == true))
     {
         // Exit if no free slots to enable the connection. (Enable is successful, even if the connection is trying to reconnect)
-        err = EnableMQTTClient(&mqttclient->conn_params, mqttclient->subscriptions);
+        err = EnableMQTTClient(mqttclient);
         if (err != USP_ERR_OK)
         {
             return err;
@@ -1085,22 +1266,6 @@ int NotifyChange_MQTTBrokerAddress(dm_req_t *req, char *value)
     return USP_ERR_OK;
 }
 
-/*********************************************************************//**
-**
-** Validate_MQTTBrokerPort
-**
-** Validates Device.MQTT.Client.{i}.BrokerPort by checking if valid number
-**
-** \param   req - pointer to structure identifying the parameter
-** \param   value - value that the controller would like to set the parameter to
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int Validate_MQTTBrokerPort(dm_req_t *req, char *value)
-{
-    return DM_ACCESS_ValidateRange_Unsigned(req, 1, 65535);
-}
 /*********************************************************************//**
 **
 ** NotifyChange_MQTTBrokerPort
@@ -1156,10 +1321,30 @@ int NotifyChange_MQTTUsername(dm_req_t *req, char *value)
 {
     mqtt_conn_params_t *mp;
     bool schedule_reconnect = false;
+    char buf[MAX_DM_SHORT_VALUE_LEN];
+    dm_vendor_get_mtp_username_cb_t   get_mtp_username_cb;
+    int err;
 
     // Determine mqtt client to be updated
     mp = FindMqttParamsByInstance(inst1);
     USP_ASSERT(mp != NULL);
+
+    // Override a blank username in the database with that provided by a core vendor hook
+    if (*value == '\0')
+    {
+        get_mtp_username_cb = vendor_hook_callbacks.get_mtp_username_cb;
+        if (get_mtp_username_cb != NULL)
+        {
+            // Exit if vendor hook failed
+            err = get_mtp_username_cb(inst1, buf, sizeof(buf));
+            if (err != USP_ERR_OK)
+            {
+                return err;
+            }
+
+            value = buf;
+        }
+    }
 
     // Determine whether to schedule a reconnect
     if ((strcmp(mp->username, value) != 0) && (mp->enable))
@@ -1196,13 +1381,30 @@ int NotifyChange_MQTTPassword(dm_req_t *req, char *value)
 {
     mqtt_conn_params_t *mp;
     bool schedule_reconnect = false;
-    //char buf[MAX_DM_SHORT_VALUE_LEN];
-    //dm_vendor_get_mtp_password_cb_t   get_mtp_password_cb;
-    //int err;
+    char buf[MAX_DM_SHORT_VALUE_LEN];
+    dm_vendor_get_mtp_password_cb_t   get_mtp_password_cb;
+    int err;
 
     // Determine mqtt client to be updated
     mp = FindMqttParamsByInstance(inst1);
     USP_ASSERT(mp != NULL);
+
+    // Override a blank password in the database with that provided by a core vendor hook
+    if (*value == '\0')
+    {
+        get_mtp_password_cb = vendor_hook_callbacks.get_mtp_password_cb;
+        if (get_mtp_password_cb != NULL)
+        {
+            // Exit if vendor hook failed
+            err = get_mtp_password_cb(inst1, buf, sizeof(buf));
+            if (err != USP_ERR_OK)
+            {
+                return err;
+            }
+
+            value = buf;
+        }
+    }
 
     // Determine whether to schedule a reconnect
     if ((strcmp(mp->password, value) != 0) && (mp->enable))
@@ -1225,22 +1427,6 @@ int NotifyChange_MQTTPassword(dm_req_t *req, char *value)
 
 /*********************************************************************//**
 **
-** Validate_MQTTKeepAliveTime
-**
-** Validates Device.MQTT.Client.{i}.KeepAliveTime by checking if valid number
-**
-** \param   req - pointer to structure identifying the parameter
-** \param   value - value that the controller would like to set the parameter to
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int Validate_MQTTKeepAliveTime(dm_req_t *req, char *value)
-{
-    return DM_ACCESS_ValidateRange_Unsigned(req, 0, 65535);
-}
-/*********************************************************************//**
-**
 ** NotifyChange_MQTTKeepAliveTime
 **
 ** Function called when Device.MQTT.Client.{i}.KeepAliveTime is modified
@@ -1254,54 +1440,59 @@ int Validate_MQTTKeepAliveTime(dm_req_t *req, char *value)
 int NotifyChange_MQTTKeepAliveTime(dm_req_t *req, char *value)
 {
     mqtt_conn_params_t *mp;
-    bool schedule_reconnect = false;
 
     // Determine mqtt client to be updated
     mp = FindMqttParamsByInstance(inst1);
     USP_ASSERT(mp != NULL);
 
-    // Determine whether to schedule a reconnect
-    if ((mp->keepalive != val_uint) && (mp->enable))
+    // Exit if value has not changed
+    if (mp->keepalive == val_uint)
     {
-        schedule_reconnect = true;
+        return USP_ERR_OK;
     }
 
-    // Set the new value. This must be done before scheduling a reconnect, so that the reconnect uses the correct values
+    // Set the new value
     mp->keepalive = val_uint;
 
-    // Schedule a reconnect after the present response has been sent, if the value has changed
-    if (schedule_reconnect)
-    {
-        ScheduleMqttReconnect(mp);
-    }
+    // Inform the MQTT MTP thread of the new value. This will take effect at the next reconnect.
+    MQTT_UpdateConnectionParams(mp, false);
 
     return USP_ERR_OK;
 }
 
 /*********************************************************************//**
 **
-** Validate_MQTTProtocolVersion
+** NotifyChange_MQTT_ALPN
 **
-** Validates Device.MQTT.Client.{i}.ProtocolVersion
-** by checking that it matches the mqtt protocol version we support
+** Function called when Device.MQTT.Client.{i}.ALPN is modified
 **
-** \param   req - pointer to structure identifying the parameter
-** \param   value - value that the controller would like to set the parameter to
+** \param   req - pointer to structure identifying the path
+** \param   value - new value of this parameter
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int Validate_MQTTProtocolVersion(dm_req_t *req, char *value)
+int NotifyChange_MQTT_ALPN(dm_req_t *req, char *value)
 {
-    mqtt_protocolver_t protocol;
+    mqtt_conn_params_t *mp;
 
-    // Exit if the protocol was invalid
-    protocol = TEXT_UTILS_StringToEnum(value, mqtt_protocolver, NUM_ELEM(mqtt_protocolver));
-    if (protocol == INVALID)
+    // Determine mqtt client to be updated
+    mp = FindMqttParamsByInstance(inst1);
+    USP_ASSERT(mp != NULL);
+
+    // Exit if value has not changed
+    if (strcmp(mp->alpn, value)==0)
     {
-        USP_ERR_SetMessage("%s: Invalid or unsupported protocol %s", __FUNCTION__, value);
-        return USP_ERR_INVALID_VALUE;
+        return USP_ERR_OK;
     }
+
+    // Set the new value
+    USP_SAFE_FREE(mp->alpn);
+    mp->alpn = USP_STRDUP(value);
+
+    // Inform the MQTT MTP thread of the new value. This will take effect at the next reconnect.
+    MQTT_UpdateConnectionParams(mp, false);
+
     return USP_ERR_OK;
 }
 
@@ -1361,27 +1552,23 @@ int NotifyChange_MQTTProtocolVersion(dm_req_t *req, char *value)
 int NotifyChange_MQTTClientId(dm_req_t *req, char *value)
 {
     mqtt_conn_params_t *mp;
-    bool schedule_reconnect = false;
 
     // Determine mqtt client to be updated
     mp = FindMqttParamsByInstance(inst1);
     USP_ASSERT(mp != NULL);
 
-    // Determine whether to schedule a reconnect
-    if ((strcmp(mp->client_id, value) != 0) && (mp->enable))
+    // Exit if the value has not changed
+    if (strcmp(mp->client_id, value) == 0)
     {
-        schedule_reconnect = true;
+        return USP_ERR_OK;
     }
 
-    // Set the new value. This must be done before scheduling a reconnect, so that the reconnect uses the correct values
+    // Set the new value in the local structure
     USP_SAFE_FREE(mp->client_id);
     mp->client_id = USP_STRDUP(value);
 
-    // Schedule a reconnect after the present response has been sent, if the value has changed
-    if (schedule_reconnect)
-    {
-        ScheduleMqttReconnect(mp);
-    }
+    // Inform the MQTT MTP thread of the new value. This will take effect at the next reconnect. Writing to ClientID must not force a reconnect
+    MQTT_UpdateConnectionParams(mp, false);
 
     return USP_ERR_OK;
 }
@@ -1401,56 +1588,24 @@ int NotifyChange_MQTTClientId(dm_req_t *req, char *value)
 int NotifyChange_MQTTName(dm_req_t *req, char *value)
 {
     mqtt_conn_params_t *mp;
-    bool schedule_reconnect = false;
 
     // Determine mqtt client to be updated
     mp = FindMqttParamsByInstance(inst1);
     USP_ASSERT(mp != NULL);
 
-    // Determine whether to schedule a reconnect
-    if ((strcmp(mp->name, value) != 0) && (mp->enable))
+    // Exit if the value has not changed
+    if (strcmp(mp->name, value) == 0)
     {
-        schedule_reconnect = true;
+        return USP_ERR_OK;
     }
 
-    // Set the new name. This must be done before scheduling a reconnect, so that the reconnect uses the correct values
+    // Set the new value in the local structure
     USP_SAFE_FREE(mp->name);
     mp->name = USP_STRDUP(value);
 
-    // Schedule a reconnect after the present response has been sent, if the value has changed
-    if (schedule_reconnect)
-    {
-        ScheduleMqttReconnect(mp);
-    }
     return USP_ERR_OK;
 }
 
-/*********************************************************************//**
-**
-** Validate_MQTTTransportProtocol
-**
-** Validates Device.MQTT.Client.{i}.TransportProtocol
-** by checking that it matches the mqtt Transport protocol we support
-**
-** \param   req - pointer to structure identifying the parameter
-** \param   value - value that the controller would like to set the parameter to
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int Validate_MQTTTransportProtocol(dm_req_t *req, char *value)
-{
-    mqtt_tsprotocol_t tsprotocol;
-
-    // Exit if the protocol was invalid
-    tsprotocol = TEXT_UTILS_StringToEnum(value, mqtt_tsprotocol, NUM_ELEM(mqtt_tsprotocol));
-    if (tsprotocol == INVALID)
-    {
-        USP_ERR_SetMessage("%s: Invalid or unsupported transport protocol %s", __FUNCTION__, value);
-        return USP_ERR_INVALID_VALUE;
-    }
-    return USP_ERR_OK;
-}
 /*********************************************************************//**
 **
 ** NotifyChange_MQTTTransportProtocol
@@ -1512,9 +1667,17 @@ int NotifyChange_MQTTCleanSession(dm_req_t *req, char *value)
     mp = FindMqttParamsByInstance(inst1);
     USP_ASSERT(mp != NULL);
 
+    // Exit if value has not changed
+    if (mp->clean_session == val_bool)
+    {
+        return USP_ERR_OK;
+    }
+
     // Set the new value
-    // NOTE: We purposefully do not schedule a reconnect. This change takes effect, the next time USP Agent connects to the MQTT Broker
     mp->clean_session = val_bool;
+
+    // Inform the MQTT MTP thread of the new value. This will take effect at the next reconnect.
+    MQTT_UpdateConnectionParams(mp, false);
 
     return USP_ERR_OK;
 }
@@ -1539,9 +1702,17 @@ int NotifyChange_MQTTCleanStart(dm_req_t *req, char *value)
     mp = FindMqttParamsByInstance(inst1);
     USP_ASSERT(mp != NULL);
 
+    // Exit if value has not changed
+    if (mp->clean_start == val_bool)
+    {
+        return USP_ERR_OK;
+    }
+
     // Set the new value
-    // NOTE: We purposefully do not schedule a reconnect. This change takes effect, the next time USP Agent connects to the MQTT Broker
     mp->clean_start = val_bool;
+
+    // Inform the MQTT MTP thread of the new value. This will take effect at the next reconnect.
+    MQTT_UpdateConnectionParams(mp, false);
 
     return USP_ERR_OK;
 }
@@ -1561,557 +1732,24 @@ int NotifyChange_MQTTCleanStart(dm_req_t *req, char *value)
 int NotifyChange_MQTTRequestResponseInfo(dm_req_t *req, char *value)
 {
     mqtt_conn_params_t *mp;
-    bool schedule_reconnect = false;
 
     // Determine mqtt client to be updated
     mp = FindMqttParamsByInstance(inst1);
     USP_ASSERT(mp != NULL);
 
-    //this parameter only supports protocol version 5.0
-    if(mp->version != kMqttProtocol_5_0)
+    // Exit if value has not changed
+    if (mp->request_response_info == val_bool)
     {
-        return EOK;
-    }
-
-    // Determine whether to schedule a reconnect
-    if ((mp->request_response_info != val_bool) && (mp->enable))
-    {
-        schedule_reconnect = true;
+        return USP_ERR_OK;
     }
 
     // Set the new value
-    // NOTE: We purposefully do not schedule a reconnect. This change takes effect, the next time USP Agent connects to the MQTT Broker
     mp->request_response_info = val_bool;
 
-    // Schedule a reconnect after the present response has been sent, if the value has changed
-    if (schedule_reconnect)
-    {
-        ScheduleMqttReconnect(mp);
-    }
-    return USP_ERR_OK;
-}
-
-/*********************************************************************//**
-**
-** NotifyChange_MQTTRequestProblemInfo
-**
-** Function called when Device.MQTT.Client.{i}.RequestProblemInfo is modified
-**
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int NotifyChange_MQTTRequestProblemInfo(dm_req_t *req, char *value)
-{
-    mqtt_conn_params_t *mp;
-    bool schedule_reconnect = false;
-
-    // Determine mqtt client to be updated
-    mp = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(mp != NULL);
-
-    //this parameter only supports protocol version 5.0
-    if(mp->version != kMqttProtocol_5_0)
-    {
-        return EOK;
-    }
-
-    // Determine whether to schedule a reconnect
-    if ((mp->request_problem_info != val_bool) && (mp->enable))
-    {
-        schedule_reconnect = true;
-    }
-
-    // Set the new value
-    // NOTE: We purposefully do not schedule a reconnect. This change takes effect, the next time USP Agent connects to the MQTT Broker
-    mp->request_problem_info = val_bool;
-
-    // Schedule a reconnect after the present response has been sent, if the value has changed
-    if (schedule_reconnect)
-    {
-        ScheduleMqttReconnect(mp);
-    }
-    return USP_ERR_OK;
-}
-
-#if 0
-// TODO: These are removed as they are not used
-/*********************************************************************//**
-**
-** NotifyChange_MQTTSessionExpiryInterval
-**
-** Function called when Device.MQTT.Client.{i}.SessionExpiryInterval is modified
-**
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int NotifyChange_MQTTSessionExpiryInterval(dm_req_t *req, char *value)
-{
-    mqtt_conn_params_t *mp;
-    bool schedule_reconnect = false;
-
-    // Determine mqtt client to be updated
-    mp = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(mp != NULL);
-
-    //this parameter only supports protocol version 5.0
-    if(mp->version != kMqttProtocol_5_0)
-    {
-        return EOK;
-    }
-
-    // Determine whether to schedule a reconnect
-    if ((mp->session_expiry != val_uint) && (mp->enable))
-    {
-        schedule_reconnect = true;
-    }
-
-    // Set the new value. This must be done before scheduling a reconnect, so that the reconnect uses the correct values
-    mp->session_expiry = val_uint;
-
-    // Schedule a reconnect after the present response has been sent, if the value has changed
-    if (schedule_reconnect)
-    {
-        ScheduleMqttReconnect(mp);
-    }
+    // Inform the MQTT MTP thread of the new value. This will take effect at the next reconnect.
+    MQTT_UpdateConnectionParams(mp, false);
 
     return USP_ERR_OK;
-}
-
-/*********************************************************************//**
-**
-** NotifyChange_MQTTReceiveMaximum
-**
-** Function called when Device.MQTT.Client.{i}.ReceiveMaximum is modified
-**
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int NotifyChange_MQTTReceiveMaximum(dm_req_t *req, char *value)
-{
-    mqtt_conn_params_t *mp;
-    bool schedule_reconnect = false;
-
-    // Determine mqtt client to be updated
-    mp = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(mp != NULL);
-
-    //this parameter only supports protocol version 5.0
-    if(mp->version != kMqttProtocol_5_0)
-    {
-        return EOK;
-    }
-    // Determine whether to schedule a reconnect
-    if ((mp->receive_max != val_uint) && (mp->enable))
-    {
-        schedule_reconnect = true;
-    }
-
-    // Set the new value. This must be done before scheduling a reconnect, so that the reconnect uses the correct values
-    mp->receive_max = val_uint;
-
-    // Schedule a reconnect after the present response has been sent, if the value has changed
-    if (schedule_reconnect)
-    {
-        ScheduleMqttReconnect(mp);
-    }
-
-    return USP_ERR_OK;
-}
-
-/*********************************************************************//**
-**
-** NotifyChange_MQTTMaximumPacketSize
-**
-** Function called when Device.MQTT.Client.{i}.MaximumPacketSize is modified
-**
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int NotifyChange_MQTTMaximumPacketSize(dm_req_t *req, char *value)
-{
-    mqtt_conn_params_t *mp;
-    bool schedule_reconnect = false;
-
-    // Determine mqtt client to be updated
-    mp = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(mp != NULL);
-
-    //this parameter only supports protocol version 5.0
-    if(mp->version != kMqttProtocol_5_0)
-    {
-        return EOK;
-    }
-    // Determine whether to schedule a reconnect
-    if ((mp->max_packet_size != val_uint) && (mp->enable))
-    {
-        schedule_reconnect = true;
-    }
-
-    // Set the new value. This must be done before scheduling a reconnect, so that the reconnect uses the correct values
-    mp->max_packet_size = val_uint;
-
-    // Schedule a reconnect after the present response has been sent, if the value has changed
-    if (schedule_reconnect)
-    {
-        ScheduleMqttReconnect(mp);
-    }
-
-    return USP_ERR_OK;
-}
-
-
-/*********************************************************************//**
-**
-** Validate_MQTTTopicAliasMaximum
-**
-** Validates Device.MQTT.Client.{i}.TopicAliasMaximum by checking if valid number
-**
-** \param   req - pointer to structure identifying the parameter
-** \param   value - value that the controller would like to set the parameter to
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int Validate_MQTTTopicAliasMaximum(dm_req_t *req, char *value)
-{
-    return DM_ACCESS_ValidateRange_Unsigned(req, 0, 65535);
-}
-/*********************************************************************//**
-**
-** NotifyChange_MQTTTopicAliasMaximum
-**
-** Function called when Device.MQTT.Client.{i}.TopicAliasMaximum is modified
-**
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int NotifyChange_MQTTTopicAliasMaximum(dm_req_t *req, char *value)
-{
-    mqtt_conn_params_t *mp;
-    bool schedule_reconnect = false;
-
-    // Determine mqtt client to be updated
-    mp = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(mp != NULL);
-
-    //this parameter only supports protocol version 5.0
-    if(mp->version != kMqttProtocol_5_0)
-    {
-        return EOK;
-    }
-    // Determine whether to schedule a reconnect
-    if ((mp->topic_alias_max != val_uint) && (mp->enable) && val_uint)
-    {
-        schedule_reconnect = true;
-    }
-
-    // Set the new value. This must be done before scheduling a reconnect, so that the reconnect uses the correct values
-    mp->topic_alias_max = val_uint;
-
-    // Schedule a reconnect after the present response has been sent, if the value has changed
-    if (schedule_reconnect)
-    {
-        ScheduleMqttReconnect(mp);
-    }
-
-    return USP_ERR_OK;
-}
-
-/*********************************************************************//**
-**
-** NotifyChange_MQTTWillEnable
-**
-** Function called when Device.MQTT.Client.{i}.WillEnable is modified
-**
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int NotifyChange_MQTTWillEnable(dm_req_t *req, char *value)
-{
-    mqtt_conn_params_t *mp;
-
-    // Determine mqtt client to be updated
-    mp = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(mp != NULL);
-
-    // Set the new value
-    // NOTE: We purposefully do not schedule a reconnect. This change takes effect, the next time USP Agent connects to the MQTT Broker
-    mp->will_enable = val_bool;
-
-    if( mp->will_enable && (!mp->will_topic || !mp->will_value))
-    {
-        return USP_ERR_INTERNAL_ERROR;
-    }
-
-    return USP_ERR_OK;
-}
-
-/*********************************************************************//**
-**
-** Validate_MQTTWillQoS
-**
-** Validates Device.MQTT.Client.{i}.WillQoS by checking if valid number
-**
-** \param   req - pointer to structure identifying the parameter
-** \param   value - value that the controller would like to set the parameter to
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int Validate_MQTTWillQoS(dm_req_t *req, char *value)
-{
-    return DM_ACCESS_ValidateRange_Unsigned(req, 0, 2);
-}
-
-/*********************************************************************//**
-**
-** NotifyChange_MQTTWillQoS
-**
-** Function called when Device.MQTT.Client.{i}.WillQoS is modified
-**
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int NotifyChange_MQTTWillQoS(dm_req_t *req, char *value)
-{
-    mqtt_conn_params_t *mp;
-
-    // Determine mqtt client to be updated
-    mp = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(mp != NULL);
-
-    // Set the new value. This must be done before scheduling a reconnect, so that the reconnect uses the correct values
-    mp->will_qos = val_uint;
-
-    return USP_ERR_OK;
-}
-
-/*********************************************************************//**
-**
-** NotifyChange_MQTTWillRetain
-**
-** Function called when Device.MQTT.Client.{i}.WillRetain is modified
-**
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int NotifyChange_MQTTWillRetain(dm_req_t *req, char *value)
-{
-    mqtt_conn_params_t *mp;
-
-    // Determine mqtt client to be updated
-    mp = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(mp != NULL);
-
-    // Set the new value
-    // NOTE: We purposefully do not schedule a reconnect. This change takes effect, the next time USP Agent connects to the MQTT Broker
-    mp->will_retain = val_bool;
-
-    return USP_ERR_OK;
-
-}
-
-/*********************************************************************//**
-**
-** NotifyChange_MQTTWillDelayInterval
-**
-** Function called when Device.MQTT.Client.{i}.WillDelayInterval is modified
-**
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int NotifyChange_MQTTWillDelayInterval(dm_req_t *req, char *value)
-{
-    mqtt_conn_params_t *mp;
-
-    // Determine mqtt client to be updated
-    mp = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(mp != NULL);
-
-    // Set the new value. This must be done before scheduling a reconnect, so that the reconnect uses the correct values
-    mp->will_delay_interval = val_uint;
-
-    return USP_ERR_OK;
-}
-
-/*********************************************************************//**
-**
-** NotifyChange_MQTTWillMessageExpiryInterval
-**
-** Function called when Device.MQTT.Client.{i}.WillMessageExpiryInterval
-** is modified
-**
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int NotifyChange_MQTTWillMessageExpiryInterval(dm_req_t *req, char *value)
-{
-    mqtt_conn_params_t *mp;
-
-    // Determine mqtt client to be updated
-    mp = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(mp != NULL);
-
-    // Set the new value. This must be done before scheduling a reconnect, so that the reconnect uses the correct values
-    mp->will_message_expiry = val_uint;
-
-    return USP_ERR_OK;
-}
-
-/*********************************************************************//**
-**
-** NotifyChange_MQTTWillContentType
-**
-** Function called when Device.MQTT.Client.{i}.WillContentType is modified
-**
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int NotifyChange_MQTTWillContentType(dm_req_t *req, char *value)
-{
-    mqtt_conn_params_t *mp;
-
-    // Determine mqtt client to be updated
-    mp = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(mp != NULL);
-
-    // Set the new name. This must be done before scheduling a reconnect, so that the reconnect uses the correct values
-    USP_SAFE_FREE(mp->will_content_type);
-    mp->will_content_type = USP_STRDUP(value);
-
-    return USP_ERR_OK;
-}
-
-/*********************************************************************//**
-**
-** NotifyChange_MQTTWillResponseTopic
-**
-** Function called when Device.MQTT.Client.{i}.WillResponseTopic is modified
-**
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int NotifyChange_MQTTWillResponseTopic(dm_req_t *req, char *value)
-{
-    mqtt_conn_params_t *mp;
-
-    // Determine mqtt client to be updated
-    mp = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(mp != NULL);
-
-    // Set the new name. This must be done before scheduling a reconnect, so that the reconnect uses the correct values
-    USP_SAFE_FREE(mp->will_response_topic);
-    mp->will_response_topic = USP_STRDUP(value);
-
-    return USP_ERR_OK;
-}
-
-/*********************************************************************//**
-**
-** NotifyChange_MQTTWillTopic
-**
-** Function called when Device.MQTT.Client.{i}.WillTopic is modified
-**
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int NotifyChange_MQTTWillTopic(dm_req_t *req, char *value)
-{
-    mqtt_conn_params_t *mp;
-
-    // Determine mqtt client to be updated
-    mp = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(mp != NULL);
-
-    // Set the new name. This must be done before scheduling a reconnect, so that the reconnect uses the correct values
-    USP_SAFE_FREE(mp->will_topic);
-    mp->will_topic = USP_STRDUP(value);
-
-    return USP_ERR_OK;
-}
-
-/*********************************************************************//**
-**
-** NotifyChange_MQTTTWillValue
-**
-** Function called when Device.MQTT.Client.{i}.WillValue is modified
-**
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int NotifyChange_MQTTTWillValue(dm_req_t *req, char *value)
-{
-    mqtt_conn_params_t *mp;
-
-    // Determine mqtt client to be updated
-    mp = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(mp != NULL);
-
-    // Set the new name. This must be done before scheduling a reconnect, so that the reconnect uses the correct values
-    USP_SAFE_FREE(mp->will_value);
-    mp->will_value = USP_STRDUP(value);
-
-    return USP_ERR_OK;
-}
-#endif
-
-/*********************************************************************//**
-**
-** Validate_MQTTConnectRetryTime
-**
-** Validates Device.MQTT.Client.{i}.ConnectRetryTime by checking if valid number
-**
-** \param   req - pointer to structure identifying the parameter
-** \param   value - value that the controller would like to set the parameter to
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int Validate_MQTTConnectRetryTime(dm_req_t *req, char *value)
-{
-    return DM_ACCESS_ValidateRange_Unsigned(req, 1, 65535);
 }
 
 /*********************************************************************//**
@@ -2134,27 +1772,19 @@ int NotifyChange_MQTTConnectRetryTime(dm_req_t *req, char *value)
     mp = FindMqttParamsByInstance(inst1);
     USP_ASSERT(mp != NULL);
 
+    // Exit if the value has not changed
+    if (mp->retry.connect_retrytime == val_uint)
+    {
+        return USP_ERR_OK;
+    }
+
     // Set the new value.
     mp->retry.connect_retrytime = val_uint;
 
-    return USP_ERR_OK;
-}
+    // Inform the MQTT MTP thread of the new value. This will take effect at the next reconnect.
+    MQTT_UpdateConnectionParams(mp, false);
 
-/*********************************************************************//**
-**
-** Validate_MQTTConnectRetryIntervalMultiplier
-**
-** Validates Device.MQTT.Client.{i}.ConnectRetryIntervalMultiplier by checking if valid number
-**
-** \param   req - pointer to structure identifying the parameter
-** \param   value - value that the controller would like to set the parameter to
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int Validate_MQTTConnectRetryIntervalMultiplier(dm_req_t *req, char *value)
-{
-    return DM_ACCESS_ValidateRange_Unsigned(req, 1000, 65535);
+    return USP_ERR_OK;
 }
 
 /*********************************************************************//**
@@ -2177,27 +1807,19 @@ int NotifyChange_MQTTConnectRetryIntervalMultiplier(dm_req_t *req, char *value)
     mp = FindMqttParamsByInstance(inst1);
     USP_ASSERT(mp != NULL);
 
+    // Exit if the value has not changed
+    if (mp->retry.interval_multiplier == val_int)
+    {
+        return USP_ERR_OK;
+    }
+
     // Set the new value.
     mp->retry.interval_multiplier = val_int;
 
-    return USP_ERR_OK;
-}
+    // Inform the MQTT MTP thread of the new value. This will take effect at the next reconnect.
+    MQTT_UpdateConnectionParams(mp, false);
 
-/*********************************************************************//**
-**
-** Validate_MQTTConnectRetryMaxInterval
-**
-** Validates Device.MQTT.Client.{i}.ConnectRetryMaxInterval by checking if valid number
-**
-** \param   req - pointer to structure identifying the parameter
-** \param   value - value that the controller would like to set the parameter to
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int Validate_MQTTConnectRetryMaxInterval(dm_req_t *req, char *value)
-{
-    return DM_ACCESS_ValidateRange_Unsigned(req, 1, 65535);
+    return USP_ERR_OK;
 }
 
 /*********************************************************************//**
@@ -2220,128 +1842,62 @@ int NotifyChange_MQTTConnectRetryMaxInterval(dm_req_t *req, char *value)
     mp = FindMqttParamsByInstance(inst1);
     USP_ASSERT(mp != NULL);
 
+    // Exit if the value has not changed
+    if (mp->retry.max_interval == val_uint)
+    {
+        return USP_ERR_OK;
+    }
+
     // Set the new value.
     mp->retry.max_interval = val_uint;
 
+    // Inform the MQTT MTP thread of the new value. This will take effect at the next reconnect.
+    MQTT_UpdateConnectionParams(mp, false);
+
     return USP_ERR_OK;
 }
 
-#if 0
-// TODO: Removed as these are not yet used
 /*********************************************************************//**
 **
-** NotifyChange_MQTTAuthenticationMethod
+** Operate_MQTTForceReconnect
 **
-** Function called when Device.MQTT.Client.{i}.AuthenticationMethod is modified
+** Implements sync command Device.MQTT.Client.{i}.ForceReconnect()
 **
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
+** \param   req - pointer to structure identifying the operation in the data model
+** \param   command_key - pointer to string containing the command key for this operation
+** \param   input_args - vector containing input arguments and their values
+** \param   output_args - vector to return output arguments in
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int NotifyChange_MQTTAuthenticationMethod(dm_req_t *req, char *value)
+int Operate_MQTTForceReconnect(dm_req_t *req, char *command_key, kv_vector_t *input_args, kv_vector_t *output_args)
 {
     mqtt_conn_params_t *mp;
+    char *status;
 
     // Determine mqtt client to be updated
     mp = FindMqttParamsByInstance(inst1);
     USP_ASSERT(mp != NULL);
 
-    //this parameter only supports protocol version 5.0
-    if(mp->version != kMqttProtocol_5_0)
+    // Exit if connection is disabled (reconnect only if the MQTT client is currently connected to the MQTT broker)
+    if (mp->enable == false)
     {
-        return USP_ERR_INTERNAL_ERROR;
+        return USP_ERR_OK;
     }
 
-    // Set the new name. This must be done before scheduling a reconnect, so that the reconnect uses the correct values
-    USP_SAFE_FREE(mp->auth_method);
-    mp->auth_method = USP_STRDUP(value);
+    // Exit if MQTT client is not currently connected to the MQTT broker (do nothing in this case)
+    status = (char *) MQTT_GetClientStatus(inst1);
+    if (strcmp(status, "Connected") != 0)
+    {
+        return USP_ERR_OK;
+    }
+
+    // Schedule a reconnect
+    ScheduleMqttReconnect(mp);
 
     return USP_ERR_OK;
 }
-
-/*********************************************************************//**
-**
-** NotifyChange_MQTTPublishMessageExpiryInterval
-**
-** Function called when Device.MQTT.Client.{i}.PublishMessageExpiryInterval is modified
-**
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int NotifyChange_MQTTPublishMessageExpiryInterval(dm_req_t *req, char *value)
-{
-    mqtt_conn_params_t *mp;
-
-    // Determine mqtt client to be updated
-    mp = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(mp != NULL);
-
-    //this parameter only supports protocol version 5.0
-    if(mp->version != kMqttProtocol_5_0)
-    {
-        return USP_ERR_INTERNAL_ERROR;
-    }
-
-    // Set the new value. This must be done before scheduling a reconnect, so that the reconnect uses the correct values
-    mp->pubmsg_expinterval = val_uint;
-
-    return USP_ERR_OK;
-}
-
-/*********************************************************************//**
-**
-** Validate_MQTTMessageRetryTime
-**
-** Validates Device.MQTT.Client.{i}.MessageRetryTime by checking if valid number
-**
-** \param   req - pointer to structure identifying the parameter
-** \param   value - value that the controller would like to set the parameter to
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int Validate_MQTTMessageRetryTime(dm_req_t *req, char *value)
-{
-    return DM_ACCESS_ValidateRange_Unsigned(req, 1, 65535);
-}
-
-/*********************************************************************//**
-**
-** NotifyChange_MQTTMessageRetryTime
-**
-** Function called when Device.MQTT.Client.{i}.MessageRetryTime is modified
-**
-** \param   req - pointer to structure identifying the path
-** \param   value - new value of this parameter
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int NotifyChange_MQTTMessageRetryTime(dm_req_t *req, char *value)
-{
-   mqtt_conn_params_t *mp;
-
-    // Determine mqtt client to be updated
-    mp = FindMqttParamsByInstance(inst1);
-    USP_ASSERT(mp != NULL);
-
-    //this parameter only supports protocol version 3.1
-    if(mp->version != kMqttProtocol_3_1)
-    {
-        return USP_ERR_INTERNAL_ERROR;
-    }
-
-    // Set the new value.
-    mp->message_retrytime = val_uint;
-
-    return USP_ERR_OK;
-}
-#endif
 
 /*********************************************************************//**
 **
@@ -2357,41 +1913,36 @@ int NotifyChange_MQTTMessageRetryTime(dm_req_t *req, char *value)
 void ScheduleMqttReconnect(mqtt_conn_params_t *mp)
 {
     USP_SAFE_FREE(mp->response_topic);
-    USP_SAFE_FREE(mp->topic);
     mp->response_topic = USP_STRDUP(DEVICE_MTP_GetAgentMqttResponseTopic(mp->instance));
-    mp->topic = USP_STRDUP(DEVICE_CONTROLLER_GetControllerTopic(mp->instance));
+    mp->publish_qos = DEVICE_MTP_GetAgentMqttPublishQos(mp->instance);
 
-    if( (mp->response_topic == NULL) || (mp->topic == NULL))
-    {
-        USP_LOG_Error("%s repsonse topic or topic not found", __FUNCTION__);
-        return;
-    }
+    // NOTE: If the agent or controller topics are NULL, this is handled by the MTP layer
 
-    MQTT_ScheduleReconnect(mp);
+    MQTT_UpdateConnectionParams(mp, true);
 }
 
 /*********************************************************************//**
 **
 ** ScheduleMQTTResubscribe
 **
-** Wrapper function to schedule a MQTT resubscribe with current MQTT subscriptions
+** Wrapper function to schedule a MQTT resubscribe of the specified MQTT subscription
 **
-** \param   mqttclient - MQTT client parameters
+** \param   mqttclient - MQTT client to modify the subscription on
+** \param   sub - subscription owned by the MQTT client to change
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-void ScheduleMQTTResubscribe(client_t *mqttclient, mqtt_subscription_t *sub)
+void ScheduleMQTTResubscribe(client_t *mqttclient, mqtt_subs_config_t *sub)
 {
+    // Update controller and agent topics. Note: Both could possibly be set to NULL
     USP_SAFE_FREE(mqttclient->conn_params.response_topic);
-    USP_SAFE_FREE(mqttclient->conn_params.topic);
-
     mqttclient->conn_params.response_topic = USP_STRDUP(DEVICE_MTP_GetAgentMqttResponseTopic(mqttclient->conn_params.instance));
-    mqttclient->conn_params.topic = USP_STRDUP(DEVICE_CONTROLLER_GetControllerTopic(mqttclient->conn_params.instance));
+    mqttclient->conn_params.publish_qos = DEVICE_MTP_GetAgentMqttPublishQos(mqttclient->conn_params.instance);
 
-    if ((mqttclient->conn_params.response_topic == NULL) || (mqttclient->conn_params.topic == NULL))
+    if (mqttclient->conn_params.response_topic == NULL)
     {
-        USP_LOG_Error("%s repsonse topic or topic not found", __FUNCTION__);
+        USP_LOG_Error("%s response topic not found", __FUNCTION__);
         return;
     }
     if ((mqttclient->conn_params.instance != INVALID) && (sub->instance != INVALID))
@@ -2420,7 +1971,7 @@ int ValidateAdd_Mqttclients(dm_req_t *req)
     mp = FindUnusedMqttParams();
     if (mp == NULL)
     {
-        USP_LOG_Error("Resources exceeded error\n");
+        USP_LOG_Error("Resources exceeded error");
         return USP_ERR_RESOURCES_EXCEEDED;
     }
     return USP_ERR_OK;
@@ -2455,7 +2006,7 @@ int Notify_MQTTClientAdded(dm_req_t *req)
     USP_ASSERT(mqttclient != NULL);         // As we had just successfully added it
 
     // Exit if no free slots to enable the connection. (Enable is successful, even if the connection is trying to reconnect)
-    err = EnableMQTTClient(&mqttclient->conn_params, mqttclient->subscriptions);
+    err = EnableMQTTClient(mqttclient);
     if (err != USP_ERR_OK)
     {
         USP_LOG_Error("Enable client failed");
@@ -2575,7 +2126,7 @@ void DestroyMQTTClient(client_t *client)
     mqtt_conn_params_t* mp = &client->conn_params;
 
     // Disable the lower level connection
-    MQTT_DisableClient(mp->instance, true);
+    MQTT_DisableClient(mp->instance);
 
     // Free and DeInitialise the slot
     MQTT_DestroyConnParams(mp);
@@ -2661,10 +2212,10 @@ client_t *FindUnusedMqttClient(void)
 ** \return  Pointer to first free subscription slot, or NULL if no slot was found
 **
 **************************************************************************/
-mqtt_subscription_t* FindSubscriptionInMqttClient(client_t* client, int instance)
+mqtt_subs_config_t* FindSubscriptionInMqttClient(client_t* client, int instance)
 {
     int i;
-    mqtt_subscription_t* sub = NULL;
+    mqtt_subs_config_t* sub = NULL;
 
     for (i = 0; i < MAX_MQTT_SUBSCRIPTIONS; i++)
     {
@@ -2690,10 +2241,10 @@ mqtt_subscription_t* FindSubscriptionInMqttClient(client_t* client, int instance
 ** \return  Pointer to first free subscription slot, or NULL if no slot was found
 **
 **************************************************************************/
-mqtt_subscription_t* FindUnusedSubscriptionInMqttClient(client_t* client)
+mqtt_subs_config_t* FindUnusedSubscriptionInMqttClient(client_t* client)
 {
     // Just find a subscription with an INVALID instance
-    mqtt_subscription_t* sub = FindSubscriptionInMqttClient(client, INVALID);
+    mqtt_subs_config_t* sub = FindSubscriptionInMqttClient(client, INVALID);
 
     if (sub != NULL)
     {
@@ -2725,11 +2276,11 @@ int ValidateAdd_MqttClientSubscriptions(dm_req_t *req)
     mqttclient = FindDevMqttClientByInstance(inst1);
     if (mqttclient == NULL)
     {
-        USP_LOG_Error("No matching MQTT client for instance: %d\n", inst1);
+        USP_LOG_Error("No matching MQTT client for instance: %d", inst1);
         return USP_ERR_RESOURCES_EXCEEDED;
     }
 
-    mqtt_subscription_t* sub = FindUnusedSubscriptionInMqttClient(mqttclient);
+    mqtt_subs_config_t* sub = FindUnusedSubscriptionInMqttClient(mqttclient);
     if (sub == NULL)
     {
         return USP_ERR_RESOURCES_EXCEEDED;
@@ -2738,13 +2289,12 @@ int ValidateAdd_MqttClientSubscriptions(dm_req_t *req)
     return USP_ERR_OK;
 }
 
-
 /*********************************************************************//**
 **
 ** Notify_MqttClientSubcriptionsAdded
 **
 ** Function called when a Mqtt client subs has been added to
-** Device.MQTT.Client.{i}.Subscritptions.{i}
+** Device.MQTT.Client.{i}.Subscription.{i}
 **
 ** \param   req - pointer to structure identifying the MQTT client
 **
@@ -2755,21 +2305,29 @@ int Notify_MqttClientSubcriptionsAdded(dm_req_t *req)
 {
     int err;
     client_t *mqttclient;
+    mqtt_subs_config_t *sub;
 
     mqttclient = FindDevMqttClientByInstance(inst1);
     USP_ASSERT(mqttclient != NULL); // As we had just successfully added it
 
     // Exit if failed to copy from DB into mqtt client array
-    err = ProcessMqttSubscriptionAdded(inst1, inst2);
+    err = ProcessMqttSubscriptionAdded(inst1, inst2, &sub);
     if (err != USP_ERR_OK)
     {
-        USP_ERR_SetMessage(" %s: Process MQTT client added failed\n", __FUNCTION__);
+        USP_ERR_SetMessage(" %s: Process MQTT client added failed", __FUNCTION__);
+        return err;
+    }
+
+    // Exit if unable to propagate the subscription to the MQTT MTP
+    err = MQTT_AddSubscription(inst1, sub);
+    if (err != USP_ERR_OK)
+    {
+        USP_ERR_SetMessage("%s: client subscribe failed", __FUNCTION__);
         return err;
     }
 
     return USP_ERR_OK;
 }
-
 
 /*********************************************************************//**
 **
@@ -2787,30 +2345,77 @@ int Notify_MqttClientSubscriptionsDeleted(dm_req_t *req)
 {
     client_t *mqttclient;
     int err = USP_ERR_OK;
+    mqtt_subs_config_t *sub;
 
+    // Exit if unable to find the MQTT client owning the subscription which has been deleted
     mqttclient = FindDevMqttClientByInstance(inst1);
-
     if (mqttclient == NULL)
     {
         return USP_ERR_OK;
     }
 
-    mqtt_subscription_t* sub = FindSubscriptionInMqttClient(mqttclient, inst2);
+    // Exit if unable to find the subscription which has been deleted
+    sub = FindSubscriptionInMqttClient(mqttclient, inst2);
     if (sub == NULL)
     {
-        USP_ERR_SetMessage("%s: Delete subscription failed\n", __FUNCTION__);
+        USP_ERR_SetMessage("%s: Delete subscription failed", __FUNCTION__);
         return USP_ERR_INTERNAL_ERROR;
     }
 
     // Delete the subscription from device_mqtt
-    MQTT_SubscriptionDestroy(sub);
+    USP_SAFE_FREE(sub->topic);
+    memset(sub, 0, sizeof(mqtt_subscription_t));
+    sub->instance = INVALID;
 
     // Delete the subscription from core mqtt
     err = MQTT_DeleteSubscription(inst1, inst2);
     if (err != USP_ERR_OK)
     {
-        USP_ERR_SetMessage("%s: Delete subscription failed\n", __FUNCTION__);
+        USP_ERR_SetMessage("%s: Delete subscription failed", __FUNCTION__);
         return err;
+    }
+
+    return USP_ERR_OK;
+}
+
+/*********************************************************************//**
+**
+** Validate_MQTTSubscriptionEnable
+**
+** Validates Device.MQTT.Client.{i}.Subscription.{i}.Enable
+**
+** \param   req - pointer to structure identifying the parameter
+** \param   value - value that the controller would like to set the parameter to
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int Validate_MQTTSubscriptionEnable(dm_req_t *req, char *value)
+{
+    client_t *mqttclient;
+    mqtt_subs_config_t *sub;
+
+    // Exit if the MQTT client or subscription does not exist yet in our local data structure
+    // NOTE: this could occur if this validate is being called as part of a USP Add, before the notify vendor hook.
+    //       In this case, the validate for the topic will prevent an empty topic, so we don't need to prevent an enable of a pre-existing empty topic
+    mqttclient = FindDevMqttClientByInstance(inst1);
+    if (mqttclient == NULL)
+    {
+        return USP_ERR_OK;
+    }
+
+    sub = FindSubscriptionInMqttClient(mqttclient, inst2);
+    if (sub == NULL)
+    {
+        return USP_ERR_OK;
+    }
+
+    // Exit if trying to enable a subscription which has an empty topic. This is not allowed.
+    if ((val_bool == true) &&
+        ((sub->topic == NULL) || (sub->topic[0] == '\0')) )
+    {
+        USP_ERR_SetMessage("%s: Cannot enable subscription with empty topic", __FUNCTION__);
+        return USP_ERR_INVALID_ARGUMENTS;
     }
 
     return USP_ERR_OK;
@@ -2832,7 +2437,7 @@ int Notify_MqttClientSubscriptionsDeleted(dm_req_t *req)
 int NotifyChange_MQTTSubscriptionEnable(dm_req_t *req, char *value)
 {
     client_t *mqttclient;
-    mqtt_subscription_t *sub;
+    mqtt_subs_config_t *sub;
     bool old_value;
 
     // Initialise to defaults
@@ -2842,7 +2447,7 @@ int NotifyChange_MQTTSubscriptionEnable(dm_req_t *req, char *value)
     sub = FindSubscriptionInMqttClient(mqttclient, inst2);
     if (sub == NULL)
     {
-        USP_ERR_SetMessage("%s: Subscription enable change failed\n", __FUNCTION__);
+        USP_ERR_SetMessage("%s: Subscription enable change failed", __FUNCTION__);
         return USP_ERR_INTERNAL_ERROR;
     }
 
@@ -2880,7 +2485,7 @@ int NotifyChange_MQTTSubscriptionEnable(dm_req_t *req, char *value)
 int NotifyChange_MQTTSubscriptionTopic(dm_req_t *req, char *value)
 {
     client_t *mqttclient;
-    mqtt_subscription_t *sub;
+    mqtt_subs_config_t *sub;
     bool schedule_reconnect = false;
 
     mqttclient = FindDevMqttClientByInstance(inst1);
@@ -2891,11 +2496,11 @@ int NotifyChange_MQTTSubscriptionTopic(dm_req_t *req, char *value)
     sub = FindSubscriptionInMqttClient(mqttclient, inst2);
     if (sub == NULL)
     {
-        USP_ERR_SetMessage("%s: Subscription topic change failed\n", __FUNCTION__);
+        USP_ERR_SetMessage("%s: Subscription topic change failed", __FUNCTION__);
         return USP_ERR_INTERNAL_ERROR;
     }
 
-    if((strcmp(sub->topic, value)) && (sub->enabled))
+    if((strcmp(sub->topic, value) != 0) && (sub->enabled))
     {
         schedule_reconnect = true;
     }
@@ -2927,7 +2532,7 @@ int NotifyChange_MQTTSubscriptionTopic(dm_req_t *req, char *value)
 **************************************************************************/
 int Validate_MQTTSubscriptionQoS(dm_req_t *req, char *value)
 {
-    return DM_ACCESS_ValidateRange_Unsigned(req, 0, 2);
+    return DM_ACCESS_ValidateRange_Unsigned(req, kMqttQos_MostOnce, kMqttQos_ExactlyOnce);
 }
 /*************************************************************************
 **
@@ -2945,12 +2550,10 @@ int Validate_MQTTSubscriptionQoS(dm_req_t *req, char *value)
 int NotifyChange_MQTTSubscriptionQoS(dm_req_t *req, char *value)
 {
     client_t *mqttclient;
-    mqtt_subscription_t *sub;
-    mqtt_qos_t old_qos;
+    mqtt_subs_config_t *sub;
     bool schedule_reconnect = false;
 
     // Initialise to defaults
-    //mqttclient = FindDevMqttClientSubscriptionByInstance(inst1, inst2);
     mqttclient = FindDevMqttClientByInstance(inst1);
     USP_ASSERT(mqttclient != NULL);
 
@@ -2959,13 +2562,11 @@ int NotifyChange_MQTTSubscriptionQoS(dm_req_t *req, char *value)
     sub = FindSubscriptionInMqttClient(mqttclient, inst2);
     if (sub == NULL)
     {
-        USP_ERR_SetMessage("%s: Subscription QoS change failed\n", __FUNCTION__);
+        USP_ERR_SetMessage("%s: Subscription QoS change failed", __FUNCTION__);
         return USP_ERR_INTERNAL_ERROR;
     }
 
-    old_qos = sub->qos;
-
-    if(old_qos != val_uint && (sub->enabled))
+    if (sub->enabled && (sub->qos != val_uint))
     {
         schedule_reconnect = true;
     }
@@ -2979,4 +2580,57 @@ int NotifyChange_MQTTSubscriptionQoS(dm_req_t *req, char *value)
     }
     return USP_ERR_OK;
 }
+
+/*********************************************************************//**
+**
+** Validate_MQTTSubscriptionTopic
+**
+** Validates that a new Device.MQTT.Client.{i}.Subscriptions.{i}.Topic is unique in the table
+**
+** \param   req - pointer to structure identifying the parameter
+** \param   value - value that the controller would like to set the parameter to
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int Validate_MQTTSubscriptionTopic(dm_req_t *req, char *value)
+{
+    int i;
+    client_t *client;
+    mqtt_subs_config_t *sub;
+
+    // Exit if no value set for Topic (i.e. set to an empty string)
+    if (*value == '\0')
+    {
+        USP_ERR_SetMessage("%s: Topic must be set to a non-empty string", __FUNCTION__);
+        return USP_ERR_INVALID_ARGUMENTS;
+    }
+
+    // Exit if the MQTT client does not exist yet in our local data structure
+    // NOTE: this could occur if this validate is being called as part of a USP Add of both client and subs, before the notify vendor hook.
+    //       In this rare case (adding MQTT client and multiple child subscriptions using a single USP Add messsage), the code does not prevent duplicate topics.
+    //       To fix this, the code in this function needs to get the values of the other topics from the USP DB, rather than using our local data structure
+    client = FindDevMqttClientByInstance(inst1);
+    if (client == NULL)
+    {
+        return USP_ERR_OK;
+    }
+
+    // Iterate over all subscriptions for this MQTT client
+    for (i=0; i<MAX_MQTT_SUBSCRIPTIONS; i++)
+    {
+        // Exit if the topic already exists in another subscription
+        sub = &client->subscriptions[i];
+        if ((sub->instance != INVALID) && (sub->instance != inst2) &&
+            (sub->topic != NULL) && (strcmp(sub->topic, value)==0))
+        {
+            USP_ERR_SetMessage("%s: Topic (%s) is already in use by Subscription.%d", __FUNCTION__, value, sub->instance);
+            return USP_ERR_UNIQUE_KEY_CONFLICT;
+        }
+    }
+
+    // If the code gets here, then the new topic is unique for this MQTT client
+    return USP_ERR_OK;
+}
+
 #endif

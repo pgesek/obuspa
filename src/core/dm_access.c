@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2020, Broadband Forum
- * Copyright (C) 2016-2020  CommScope, Inc
+ * Copyright (C) 2021-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -419,6 +419,37 @@ int DM_ACCESS_ValidateBool(dm_req_t *req, char *value)
     return err;
 }
 
+#ifndef REMOVE_DEVICE_SECURITY
+/*********************************************************************//**
+**
+** DM_ACCESS_ValidateBase64
+**
+** Validates that the specified value string represents a base64 encoded binary blob
+** This function is supplied to be used as a vendor hook validation callback
+**
+** \param   req - pointer to structure containing path information
+** \param   value - value of the parameter to check
+**
+** \return  USP_ERR_OK if validated successfully
+**          USP_ERR_INVALID_TYPE if string value does not represent a base64 encoded string
+**
+**************************************************************************/
+int DM_ACCESS_ValidateBase64(dm_req_t *req, char *value)
+{
+    int err;
+    unsigned char buf[MAX_DM_VALUE_LEN];
+
+    err = TEXT_UTILS_Base64StringToBinary(value, buf, sizeof(buf), NULL);
+    if (err != USP_ERR_OK)
+    {
+        USP_ERR_SetMessage("%s: Invalid base64 encoded string for param=%s", __FUNCTION__, req->path);
+        return err;
+    }
+
+    return USP_ERR_OK;
+}
+#endif
+
 /*********************************************************************//**
 **
 ** DM_ACCESS_ValidatePort
@@ -557,7 +588,7 @@ int DM_ACCESS_ValidateReference(char *reference, char *table, int *instance)
     }
 
     // Determine the expected number of instance numbers in the specified table
-    node = DM_PRIV_GetNodeFromPath(table, NULL, NULL);
+    node = DM_PRIV_GetNodeFromPath(table, NULL, NULL, 0);
     USP_ASSERT(node != NULL);       // These asserts check that the caller provided a multi-instance table that exists in the supported data model
     USP_ASSERT(node->order > 0);
 
@@ -984,7 +1015,7 @@ int DM_ACCESS_DontRestartAsyncOperation(dm_req_t *req, int instance, bool *is_re
 ** DM_ACCESS_PopulateAliasParam
 **
 ** Called to get an auto-populated parameter value for an Alias parameter
-** This function takes account of the multi-dimentionality of the object
+** This function takes account of the multi-dimensionality of the object
 ** Using the highest order dimension to number the instance
 **
 ** \param   req - pointer to structure identifying the path

@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2020, Broadband Forum
- * Copyright (C) 2017-2020  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2017-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -49,6 +49,7 @@
 #include "usp_api.h"
 #include "dm_access.h"
 #include "dm_trans.h"
+#include "dm_inst_vector.h"
 #include "msg_handler.h"
 
 
@@ -79,7 +80,6 @@ int DEVICE_REQUEST_Init(void)
 {
     int err = USP_ERR_OK;
 
-
     err |= USP_REGISTER_Object(DEVICE_REQ_ROOT ".{i}",
                               USP_HOOK_DenyAddInstance, NULL, NULL,
                               USP_HOOK_DenyDeleteInstance, NULL, DeleteRequestArgs);
@@ -97,6 +97,8 @@ int DEVICE_REQUEST_Init(void)
     // Arguments associated with Async Operations that have the RESTART_ON_REBOOT flag set
     // These objects shadow the objects in the request table - having the same instance number for the operation
     // The lifetime of these shadow objects match those of the object in the request table.
+    err |= USP_REGISTER_Object("Internal.Request.{i}", NULL, NULL, NULL, NULL, NULL, NULL);
+    err |= USP_REGISTER_Object("Internal.Request.{i}.InputArgs.{i}", NULL, NULL, NULL, NULL, NULL, NULL);
     err |= USP_REGISTER_DBParam_ReadWrite("Internal.Request.{i}.InputArgs.{i}.Name", "", NULL, NULL, DM_STRING);
     err |= USP_REGISTER_DBParam_ReadWrite("Internal.Request.{i}.InputArgs.{i}.Value", "", NULL, NULL, DM_STRING);
     if (err != USP_ERR_OK)
@@ -188,7 +190,7 @@ int DEVICE_REQUEST_Add(char *path, char *command_key, int *instance)
 ** \param   instance - instance number of operation in Device.LocalAgent.Request table
 ** \param   err_code - error code of the operation (USP_ERR_OK indicates success)
 ** \param   err_msg - error message if the operation failed, or NULL if operation was successful
-** \param   output_args - results of the completed operation (if successful)
+** \param   output_args - results of the completed operation (if successful). NULL indicates no output arguments.
 **
 ** \return  None - This code must handle any errors
 **
@@ -197,7 +199,6 @@ void DEVICE_REQUEST_OperationComplete(int instance, int err_code, char *err_msg,
 {
     int err;
     char path[MAX_DM_PATH];
-    dm_trans_vector_t trans;
     char command[MAX_DM_PATH];
     char command_key[MAX_DM_SHORT_VALUE_LEN];
 
@@ -224,11 +225,11 @@ void DEVICE_REQUEST_OperationComplete(int instance, int err_code, char *err_msg,
         dm_node_t *node;
         dm_oper_info_t *info;
 
-        node = DM_PRIV_GetNodeFromPath(command, NULL, NULL);
+        node = DM_PRIV_GetNodeFromPath(command, NULL, NULL, 0);
         USP_ASSERT(node != NULL);
 
         info = &node->registered.oper_info;
-        err = KV_VECTOR_ValidateArguments(output_args, &info->output_args);
+        err = KV_VECTOR_ValidateArguments(output_args, &info->output_args, NO_FLAGS);
         if (err != USP_ERR_OK)
         {
             USP_LOG_Warning("%s: Output argument names do not match those registered (%s). Please check code.", __FUNCTION__, command);
@@ -244,15 +245,37 @@ void DEVICE_REQUEST_OperationComplete(int instance, int err_code, char *err_msg,
         return;
     }
 
+    // Send operation complete events to all subscribers
+    DEVICE_SUBSCRIPTION_ProcessAllOperationCompleteSubscriptions(command, command_key, err_code, err_msg, output_args);
+
+    // Finally, delete the entry in the request table
+    DEVICE_REQUEST_DeleteInstance(instance);
+}
+
+/*********************************************************************//**
+**
+** DEVICE_REQUEST_DeleteInstance
+**
+** Deletes the specified instance in the Request table
+** This function is called, after it is known that the operation has completed
+**
+** \param   instance - instance number in Device.LocalAgent.Request.{i}
+**
+** \return  None
+**
+**************************************************************************/
+void DEVICE_REQUEST_DeleteInstance(int instance)
+{
+    int err;
+    char path[MAX_DM_PATH];
+    dm_trans_vector_t trans;
+
     // Exit if unable to start a database transaction
     err = DM_TRANS_Start(&trans);
     if (err != USP_ERR_OK)
     {
         return;
     }
-
-    // Send operation complete events to all subscribers
-    DEVICE_SUBSCRIPTION_ProcessAllOperationCompleteSubscriptions(command, command_key, err_code, err_msg, output_args);
 
     // Exit if unable to remove this operation from the request table
     // NOTE: Deletion of this instance will cascade to delete any persisted input args
@@ -361,22 +384,24 @@ int DEVICE_REQUEST_RestartAsyncOperations(void)
             goto exit;
         }
 
-        // Exit if unable to determine whether the operation should be restarted
+        // Determine whether the operation should be restarted
         KV_VECTOR_Init(&output_args);       // Not strictly necessary
         err = DATA_MODEL_ShouldOperationRestart(op_path, instance, &is_restart, &err_code, err_msg, sizeof(err_msg), &output_args);
+
+        // If we cannot determine whether the operation can be restarted (eg because the USP command is not in
+        // the supported data model anymore), then assume that the operation cannot be restarted
         if (err != USP_ERR_OK)
         {
-            goto exit;
+            USP_SNPRINTF(err_msg, sizeof(err_msg), "%s: USP Command '%s' cannot be restarted", __FUNCTION__, op_path);
+            is_restart = false;
+            err_code = USP_ERR_COMMAND_FAILURE;
         }
 
         if (is_restart)
         {
-            // Exit if unable to restart the operation
-            err = RestartAsyncOperation(op_path, instance);
-            if (err != USP_ERR_OK)
-            {
-                goto exit;
-            }
+            // Attempt to restart the operation, sending an operation complete and removing the entry
+            // from the Request table if this fails
+            RestartAsyncOperation(op_path, instance);
         }
         else
         {
@@ -457,6 +482,85 @@ int DEVICE_REQUEST_PersistOperationArgs(int instance, kv_vector_t *args, char *p
     }
 
     return USP_ERR_OK;
+}
+
+/*********************************************************************//**
+**
+** DEVICE_REQUEST_CountMatchingRequests
+**
+** Determines the number of times that the specified command is present in the Request table
+** and hence already in progress
+**
+** \param   command_path - Schema path of the command in the data model which we want to count the number of occurrences of
+**
+** \return  Number of occurrences of the specified command in the request table, or INVALID if an error occurred
+**
+**************************************************************************/
+int DEVICE_REQUEST_CountMatchingRequests(char *command_path)
+{
+    int_vector_t iv;
+    dm_instances_t inst;
+    bool is_qualified_instance;
+    dm_node_t *command_node;
+    dm_node_t *node;
+    int err;
+    int i;
+    int instance;
+    char path[MAX_DM_PATH];
+    char buf[MAX_DM_VALUE_LEN];
+    int count = 0;
+
+    INT_VECTOR_Init(&iv);
+
+    // Find node representing the specified command to find
+    command_node = DM_PRIV_GetNodeFromPath(command_path, NULL, NULL, 0);
+    USP_ASSERT(command_node != NULL);
+
+    // Find node representing the request table
+    node = DM_PRIV_GetNodeFromPath(DEVICE_REQ_ROOT ".{i}", &inst, &is_qualified_instance, 0);
+    USP_ASSERT(node != NULL);
+
+    // Get an array of instances for in the request table
+    err = DM_INST_VECTOR_GetInstances(node, &inst, &iv);
+    if (err != USP_ERR_OK)
+    {
+        count = INVALID;
+        goto exit;
+    }
+
+    // Iterate over all instances in the request table
+    for (i=0; i < iv.num_entries; i++)
+    {
+        // Form the param path containing the command for this instance in the table
+        instance = iv.vector[i];
+        USP_SNPRINTF(path, sizeof(path), "%s.%d.Command", DEVICE_REQ_ROOT, instance);
+
+        // Exit if unable to get the command parameter for this instance
+        err = DATA_MODEL_GetParameterValue(path, buf, sizeof(buf), 0);
+        if (err != USP_ERR_OK)
+        {
+            count = INVALID;
+            goto exit;
+        }
+
+        // Exit if unable to get the data model node associated with the command in this entry of the request table
+        // NOTE: This should never happen. It could only happen if commands have been removed from the data model schema
+        node = DM_PRIV_GetNodeFromPath(buf, NULL, NULL, 0);
+        if (node == NULL)
+        {
+            goto exit;
+        }
+
+        // Increase the count if the command in this instance of the table, matched the specified command
+        if (node == command_node)
+        {
+            count++;
+        }
+    }
+
+exit:
+    INT_VECTOR_Destroy(&iv);
+    return count;
 }
 
 /*********************************************************************//**

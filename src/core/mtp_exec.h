@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2021, Broadband Forum
- * Copyright (C) 2016-2021  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  * Copyright (C) 2020, BT PLC
  *
  * Redistribution and use in source and binary forms, with or without
@@ -44,7 +44,9 @@
 
 #include <time.h>
 #include <stdbool.h>
-#include "vendor_defs.h"  // for ENABLE_COAP
+
+#include "vendor_defs.h"    // for E2ESESSION_EXPERIMENTAL_USP_V_1_2
+#include "usp-msg.pb-c.h"
 
 //-----------------------------------------------------------------------------------------------
 // Enumeration of Device.LocalAgent.MTP.{i}.Status
@@ -69,6 +71,12 @@ typedef enum
 #ifdef ENABLE_MQTT
     kMtpProtocol_MQTT,
 #endif
+#ifdef ENABLE_WEBSOCKETS
+    kMtpProtocol_WebSockets,
+#endif
+#ifdef ENABLE_UDS
+    kMtpProtocol_UDS,
+#endif
 
     // The following enumeration should always be the last - it is used to size arrays
     kMtpProtocol_Max
@@ -78,9 +86,38 @@ typedef enum
 // Enumeration describing what the contents of pbuf are to MSG_HANDLER_LogMessageToSend()
 typedef enum
 {
-    kMtpContentType_UspRecord,        // Protobuf encoded USP Record
-    kMtpContentType_Text,             // Plain text
+    kMtpContentType_UspMessage,       // Protobuf encoded USP Record containing an unsegmented USP message. No session context.
+    kMtpContentType_ConnectRecord,    // A STOMP, MQTT, WebSockets or UDS USP Connect record
+    kMtpContentType_DisconnectRecord, // A USP Disconnect record that causes the MTP to disconnect (and retry)
+    kMtpContentType_BulkDataReport,   // Raw Bulk Data report to put into the MTP frame
+#ifdef E2ESESSION_EXPERIMENTAL_USP_V_1_2
+    kMtpContentType_E2E_SessTermination, // A USP Disconnect record that doesn't cause the MTP to disconnect (used to terminate an E2E session)
+    kMtpContentType_E2E_FullMessage,  // USP Record containing a full USP message in a session context
+                                      // NOTE: The reason this is differentiated from kMtpContentType_UspMessage is that this USP message is logged before sending
+    kMtpContentType_E2E_Begin,        // USP Record containing the first fragment of a segmented USP message
+    kMtpContentType_E2E_InProcess,    // USP Record containing a middle fragment of a segmented USP message
+    kMtpContentType_E2E_Complete,     // USP Record containing the last fragment of a segmented USP message
+#endif
 } mtp_content_type_t;
+
+//------------------------------------------------------------------------------
+// Macro to determine whether the content is a connect or disconnect record
+// Used to ensure there are no stale USP connect or disconnect records in the MTP's USP record message queue
+#if defined(E2ESESSION_EXPERIMENTAL_USP_V_1_2)
+    #define IsUspConnectOrDisconnectRecord(type)  ((type == kMtpContentType_ConnectRecord) || (type == kMtpContentType_DisconnectRecord) || (type == kMtpContentType_E2E_SessTermination))
+#else
+    #define IsUspConnectOrDisconnectRecord(type)  ((type == kMtpContentType_ConnectRecord) || (type == kMtpContentType_DisconnectRecord))
+#endif
+
+//------------------------------------------------------------------------------
+// Structure containing common elements about payload/body content to send by the MTP
+typedef struct
+{
+    mtp_content_type_t content_type;    // Type of content in the payload.
+    Usp__Header__MsgType usp_msg_type;  // USP Message type
+    uint8_t *pbuf;                      // Payload to be sent by the MTP (USP Record)
+    int pbuf_len;                       // Length of the payload
+} mtp_send_item_t;
 
 //------------------------------------------------------------------------------
 // Structure containing a count of causes of connectivity failures for a particular MTP (eg STOMP, HTTP)
@@ -113,12 +150,15 @@ typedef enum
 //------------------------------------------------------------------------------
 // Global Variables
 extern scheduled_action_t mtp_exit_scheduled;
+extern bool mtp_reconnect_scheduled;
 extern bool is_coap_mtp_thread_exited;
 extern bool is_stomp_mtp_thread_exited;
 extern bool is_mqtt_mtp_thread_exited;
+extern bool is_uds_mtp_thread_exited;
 
 //------------------------------------------------------------------------------
 // API functions
+void MTP_EXEC_MtpSendItem_Init(mtp_send_item_t *msi);
 int MTP_EXEC_Init(void);
 void MTP_EXEC_ScheduleExit(void);
 void MTP_EXEC_ActivateScheduledActions(void);
@@ -134,6 +174,11 @@ void MTP_EXEC_CoapWakeup(void);
 void *MTP_EXEC_MqttMain(void *args);
 void MTP_EXEC_MqttWakeup(void);
 #endif
+#ifdef ENABLE_UDS
+void *MTP_EXEC_UdsMain(void *args);
+void MTP_EXEC_UdsWakeup(void);
+#endif
+
 //------------------------------------------------------------------------------
 
 #endif

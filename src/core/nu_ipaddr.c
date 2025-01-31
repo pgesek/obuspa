@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019, Broadband Forum
- * Copyright (C) 2007-2019  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2007-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -1409,7 +1409,8 @@ int tw_ulib_get_dev_ipaddr(const char *dev, char *addr, size_t asiz, bool prefer
         USP_ERR_SetMessage("%s: No IP address found for interface %s", __FUNCTION__, dev);
         err = USP_ERR_INTERNAL_ERROR;
     }
-    else {
+    else
+    {
         err = USP_ERR_OK;
     }
 

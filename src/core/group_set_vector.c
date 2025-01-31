@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2020, Broadband Forum
- * Copyright (C) 2020  CommScope, Inc
+ * Copyright (C) 2020-2024, Broadband Forum
+ * Copyright (C) 2020-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -129,11 +129,29 @@ void GROUP_SET_VECTOR_Add(group_set_vector_t *gsv, char *path, char *value, bool
     unsigned type_flags;
 
     // Exit if path does not exist in the schema
-    path_properties = DATA_MODEL_GetPathProperties(path, combined_role, &permission_bitmask, &group_id, &type_flags);
+    path_properties = DATA_MODEL_GetPathProperties(path, combined_role, &permission_bitmask, &group_id, &type_flags, 0);
     if ((path_properties & PP_EXISTS_IN_SCHEMA) == 0)
     {
         err_code = USP_ERR_UNSUPPORTED_PARAM;
         err_msg = USP_ERR_GetMessage();
+        goto exit;
+    }
+
+    // Exit if path is an object. This could occur when performing an AddObject, if the name of a child parameter was empty
+    if (path_properties & PP_IS_OBJECT)
+    {
+        USP_SNPRINTF(buf, sizeof(buf), "%s: Parameter name is empty for child parameter of %s", __FUNCTION__, path);
+        err_code = USP_ERR_INVALID_ARGUMENTS;
+        err_msg = buf;
+        goto exit;
+    }
+
+    // Exit if path is not a parameter. This could occur when performing an AddObject, if the name of the child parameter is actually a child object, event or command
+    if ((path_properties & PP_IS_PARAMETER) == 0)
+    {
+        USP_SNPRINTF(buf, sizeof(buf), "%s: %s is not a parameter", __FUNCTION__, path);
+        err_code = USP_ERR_INTERNAL_ERROR;
+        err_msg = buf;
         goto exit;
     }
 
@@ -155,7 +173,7 @@ void GROUP_SET_VECTOR_Add(group_set_vector_t *gsv, char *path, char *value, bool
         goto exit;
     }
 
-    // If the code gets here, then there were no errors detected which would prevent the parameter from being obtained later
+    // If the code gets here, then there were no errors detected which would prevent the parameter from being set later
 
 exit:
     // All cases result in adding the path to the group set vector
@@ -173,6 +191,59 @@ exit:
     gse->is_required = is_required;
     gse->err_code = err_code;
     gse->err_msg = USP_STRDUP(err_msg);
+}
+
+/*********************************************************************//**
+**
+** GROUP_SET_VECTOR_AreAllPathsTheSameGroupId
+**
+** Determines whether the specified slice of parameters in the vector are all owned by the same group_id
+** This function is used to fail USP Sets where the parameters span more than one owner (USP Service or core data model)
+** We need to fail them because it is not possible to rollback a set on a USP Service
+** (to do that, we would have to get the value of the parameters before performing a set, which is too expensive computationally
+** and there is the possibility that rollback may fail, leaving the objects in an unknown state. So instead we don't allow it)
+**
+** NOTE: We can't just limit checking of a single group id to required params only
+**       because failure to set a required parameter would need to result in the rollback of all previously set
+**       non-required parameters and this cannot be achieved if they are owned by a USP Service
+**
+** NOTE: Likewise, we cannot limit checking to just USP Services. We need to include core data model parameters too.
+**       Whilst core data model parameters can be rolled back, failure to set a core data model parameter
+**       would need to result in the rollback of all previously set parameters and this cannot be achieved if they are owned
+**       by a USP Service
+**
+** \param   gsv - Contains the list of parameters to check
+** \param   index - index of first parameter to checkt in the vector
+** \param   num_entries - number of parameters to check (from index onwards)
+**
+** \return  true if all parameters in the set have the same owner, false otherwise
+**
+**************************************************************************/
+bool GROUP_SET_VECTOR_AreAllPathsTheSameGroupId(group_set_vector_t *gsv, int index, int num_entries)
+{
+    int i;
+    int first_group_id;
+    int group_id;
+
+    // Exit if there are no paths. In this case we indicate that all of the paths are the same
+    if (gsv->num_entries == 0)
+    {
+        return true;
+    }
+
+    // Iterate over all paths in this slice
+    first_group_id = gsv->vector[index].group_id;
+    for (i=0; i < num_entries; i++)
+    {
+        // Exit if this group_id does not match the first group_id found
+        group_id = gsv->vector[index + i].group_id;
+        if (group_id != first_group_id)
+        {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 /*********************************************************************//**

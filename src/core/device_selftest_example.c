@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019, Broadband Forum
- * Copyright (C) 2016-2019  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -103,6 +103,7 @@ int DEVICE_SELF_TEST_Init(void)
 
     // Register self test diagnostics
     err |= USP_REGISTER_AsyncOperation("Device.SelfTestDiagnostics()", DEVICE_SELF_TEST_Operate, NULL);
+    err |= USP_REGISTER_AsyncOperation_MaxConcurrency("Device.SelfTestDiagnostics()", 1);
     err |= USP_REGISTER_OperationArguments("Device.SelfTestDiagnostics()", selftest_input_args, NUM_ELEM(selftest_input_args),
                                                                            selftest_output_args, NUM_ELEM(selftest_output_args));
 
@@ -155,7 +156,7 @@ int DEVICE_SELF_TEST_Operate(dm_req_t *req, kv_vector_t *input_args, int instanc
 
     // Exit if unable to start a thread to perform this operation
     // NOTE: ownership of input conditions passes to the thread
-    err = OS_UTILS_CreateThread(SelfTestDiagThreadMain, cond);
+    err = OS_UTILS_CreateThread("SelfTestDiag", SelfTestDiagThreadMain, cond);
     if (err != USP_ERR_OK)
     {
         err = USP_ERR_COMMAND_FAILURE;

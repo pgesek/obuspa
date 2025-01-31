@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2021, Broadband Forum
- * Copyright (C) 2016-2021  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  * Copyright (C) 2020, BT PLC
  *
  * Redistribution and use in source and binary forms, with or without
@@ -45,14 +45,11 @@
 #include <string.h>
 #include <getopt.h>
 #include <limits.h>
-#include <protobuf-c/protobuf-c.h>
-#include <curl/curl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <syslog.h>
 #include <unistd.h>
 
-#include "usp-msg.pb-c.h"
 #include "common_defs.h"
 #include "mtp_exec.h"
 #include "dm_exec.h"
@@ -69,7 +66,65 @@
 #include "stomp.h"
 #include "retry_wait.h"
 #include "nu_macaddr.h"
+#include "plugin.h"
 
+
+#ifdef ENABLE_WEBSOCKETS
+#include "wsclient.h"
+#include "wsserver.h"
+#endif
+
+#ifndef REMOVE_USP_SERVICE
+#include "usp_service.h"
+#endif
+
+#ifdef ENABLE_UDS
+#include "uds.h"
+#endif
+
+//--------------------------------------------------------------------------------------
+// Determine whether libcurl and libssl are required by the USP Agent
+
+#ifndef REMOVE_DEVICE_BULKDATA
+#undef REQUIRE_CURL
+#define REQUIRE_CURL
+#endif
+
+
+#ifdef REQUIRE_CURL
+#include <curl/curl.h>
+#undef REQUIRE_SSL
+#define REQUIRE_SSL
+#endif
+
+#ifndef REMOVE_DEVICE_SECURITY
+#undef REQUIRE_SSL
+#define REQUIRE_SSL
+#endif
+
+#ifndef DISABLE_STOMP
+#undef REQUIRE_SSL
+#define REQUIRE_SSL
+#endif
+
+#ifdef ENABLE_MQTT
+#undef REQUIRE_SSL
+#define REQUIRE_SSL
+#endif
+
+#ifdef ENABLE_WEBSOCKETS
+#undef REQUIRE_SSL
+#define REQUIRE_SSL
+#endif
+
+#ifdef ENABLE_COAP
+#undef REQUIRE_SSL
+#define REQUIRE_SSL
+#endif
+
+#ifdef REQUIRE_SSL
+#include <openssl/ssl.h>
+#endif
 
 #ifndef OVERRIDE_MAIN
 //--------------------------------------------------------------------------------------
@@ -84,26 +139,35 @@ static struct option long_options[] =
     {"dbfile",     required_argument, NULL, 'f'},    // Sets the name of the path to use for the database file
     {"verbose",    required_argument, NULL, 'v'},    // Verbosity level for debug logging
     {"meminfo",    no_argument,       NULL, 'm'},    // Collects and prints information useful to debugging memory leaks
+#ifdef HAVE_EXECINFO_H
     {"error",      no_argument,       NULL, 'e'},    // Prints the callstack whenever an error is detected
-    {"prototrace" ,no_argument,       NULL, 'p'},    // Enables logging of the protocol trace
+#endif
+    {"prototrace", no_argument,       NULL, 'p'},    // Enables logging of the protocol trace
     {"command",    no_argument,       NULL, 'c'},    // The rest of the command line is a command to invoke on the active USP Agent.
                                                      // Using this option turns this executable into just a CLI for the active USP Agent.
-    {"authcert",   no_argument,       NULL, 'a'},    // Specifies the location of a file containing the client certificate to use authenticating this device
+#ifndef REMOVE_DEVICE_SECURITY
+    {"authcert",   required_argument, NULL, 'a'},    // Specifies the location of a file containing the client certificate to use authenticating this device
     {"truststore", required_argument, NULL, 't'},    // Specifies the location of a file containing the trust store certificates to use
+#endif
     {"resetfile",  required_argument, NULL, 'r'},    // Specifies the location of a text file containing factory reset parameters
     {"interface",  required_argument, NULL, 'i'},    // Specifies the networking interface to use for communications
+    {"cli",        required_argument, NULL, 's'},    // Specifies the Unix domain socket file to use for CLI communications
+    {"register",   required_argument, NULL, 'R'},    // Specifies the top level data model objects to register. Use of this option runs the Agent as a USP Service,
+    {"plugin",     required_argument, NULL, 'x'},    // Specifies the path to a vendor plugin - can be used multiple times to load multiple plugins
 
     {0, 0, 0, 0}
 };
 
 // In the string argument, the colons (after the option) mean that those options require arguments
-static char short_options[] = "hl:f:v:a:t:r:i:mepc";
-#endif
+static char short_options[] = "hl:f:v:a:t:r:i:mepcs:R:x:";
+#endif // OVERRIDE_MAIN
 
 //--------------------------------------------------------------------------------------
 // Variables set by command line arguments
 bool enable_callstack_debug = false;    // Enables printing of the callstack when an error occurs
 
+
+char *cli_uds_file = CLI_UNIX_DOMAIN_FILE;  // filename path of Unix domain socket used for CLI commands
 
 //--------------------------------------------------------------------------------------
 // Forward declarations. Note these are not static, because we need them in the symbol table for USP_LOG_Callstack() to show them
@@ -183,15 +247,19 @@ int main(int argc, char *argv[])
                 enable_mem_info = true;
                 break;
 
+#ifdef HAVE_EXECINFO_H
             case 'e':
                 // Enable callstack printing when an error occurs
                 enable_callstack_debug = true;
                 break;
+#endif
 
             case 'p':
                 // Enable logging of protocol trace
                 enable_protocol_trace = true;
                 break;
+
+#ifndef REMOVE_DEVICE_SECURITY
 
             case 'a':
                 // Set the location of the client certificate file to use
@@ -202,12 +270,26 @@ int main(int argc, char *argv[])
                 // Set the location of the file containing trust store certificates
                 usp_trust_store_file = optarg;
                 break;
-
+#endif
             case 'r':
                 // Set the location of the text file containing the factory reset parameters
                 factory_reset_text_file = optarg;
                 break;
 
+            case 's':
+                // Set the location of the Unix domain socket file to use for the CLI
+                cli_uds_file = optarg;
+                break;
+
+            case 'R':
+#ifndef REMOVE_USP_SERVICE
+                // Set the top-level data model objects to register and run this Agent as a USP Service
+                usp_service_objects = optarg;
+#else
+                USP_LOG_Error("ERROR: The -R (--register) option is not supported on builds compiled with REMOVE_USP_SERVICE defined");
+                goto exit;
+#endif
+                break;
             case 'i':
                 // Set the networking interface to use for USP communication
                 if (nu_ipaddr_is_valid_interface(optarg) != true)
@@ -236,6 +318,10 @@ int main(int argc, char *argv[])
                 return err;
                 break;
 
+
+            case 'x':
+                PLUGIN_Load(optarg);
+                break;
 
             default:
                 USP_LOG_Error("ERROR: USP Agent was invoked with the '-%c' option but the code was not compiled in.", c);
@@ -280,7 +366,7 @@ int main(int argc, char *argv[])
 
     // Exit if unable to spawn off a thread to service the MTPs
 #ifndef DISABLE_STOMP
-    err = OS_UTILS_CreateThread(MTP_EXEC_StompMain, NULL);
+    err = OS_UTILS_CreateThread("MTP_STOMP", MTP_EXEC_StompMain, NULL);
     if (err != USP_ERR_OK)
     {
         goto exit;
@@ -288,7 +374,7 @@ int main(int argc, char *argv[])
 #endif
 
 #ifdef ENABLE_COAP
-    err = OS_UTILS_CreateThread(MTP_EXEC_CoapMain, NULL);
+    err = OS_UTILS_CreateThread("MTP_CoAP", MTP_EXEC_CoapMain, NULL);
     if (err != USP_ERR_OK)
     {
         goto exit;
@@ -296,19 +382,43 @@ int main(int argc, char *argv[])
 #endif
 
 #ifdef ENABLE_MQTT
-    err = OS_UTILS_CreateThread(MTP_EXEC_MqttMain, NULL);
+    err = OS_UTILS_CreateThread("MTP_MQTT", MTP_EXEC_MqttMain, NULL);
     if (err != USP_ERR_OK)
     {
         goto exit;
     }
 #endif
 
-    // Exit if unable to spawn off a thread to perform bulk data collection posts
-    err = OS_UTILS_CreateThread(BDC_EXEC_Main, NULL);
+#ifdef ENABLE_WEBSOCKETS
+    err = OS_UTILS_CreateThread("MTP_WSClient", WSCLIENT_Main, NULL);
     if (err != USP_ERR_OK)
     {
         goto exit;
     }
+
+    err = OS_UTILS_CreateThread("MTP_WSServer", WSSERVER_Main, NULL);
+    if (err != USP_ERR_OK)
+    {
+        goto exit;
+    }
+#endif
+
+#ifdef ENABLE_UDS
+    err = OS_UTILS_CreateThread("MTP_UDS", MTP_EXEC_UdsMain, NULL);
+    if (err != USP_ERR_OK)
+    {
+        goto exit;
+    }
+#endif
+
+#ifndef REMOVE_DEVICE_BULKDATA
+    // Exit if unable to spawn off a thread to perform bulk data collection posts
+    err = OS_UTILS_CreateThread("BulkDataColl", BDC_EXEC_Main, NULL);
+    if (err != USP_ERR_OK)
+    {
+        goto exit;
+    }
+#endif
 
     // Run the data model main loop of USP Agent (this function does not return)
     DM_EXEC_Main(NULL);
@@ -334,8 +444,35 @@ exit:
 **************************************************************************/
 int MAIN_Start(char *db_file, bool enable_mem_info)
 {
-    CURLcode curl_err;
     int err;
+
+    // Initialise SSL
+#ifdef REQUIRE_SSL
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
+#else
+    OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS, NULL);
+#endif
+#endif
+
+    // Initialise libcurl
+#ifdef REQUIRE_CURL
+    CURLcode curl_err;
+
+#if (LIBCURL_VERSION_NUM >= 0x073800)
+    CURLsslset curl_sslset_err;
+
+    // Exit if unable to select SSL backend for curl
+    // This is necessary as curl supports multiple SSL backends, the default of which might not be OpenSSL
+    curl_sslset_err = curl_global_sslset(CURLSSLBACKEND_OPENSSL, NULL, NULL);
+    if (curl_sslset_err != CURLSSLSET_OK)
+    {
+        USP_LOG_Error("%s: Failed to select OpenSSL backend for libcurl (curl_global_sslset err=%d)", __FUNCTION__, curl_sslset_err);
+        return USP_ERR_INTERNAL_ERROR;
+    }
+#endif
 
     // Exit if unable to initialise libraries which need to be initialised when running single threaded
     curl_err = curl_global_init(CURL_GLOBAL_ALL);
@@ -344,6 +481,7 @@ int MAIN_Start(char *db_file, bool enable_mem_info)
         USP_LOG_Error("%s: curl_global_init() failed (curl_err=%d)", __FUNCTION__, curl_err);
         return USP_ERR_INTERNAL_ERROR;
     }
+#endif // REQUIRE_CURL
 
     SYNC_TIMER_Init();
 
@@ -362,7 +500,9 @@ int MAIN_Start(char *db_file, bool enable_mem_info)
     // Exit if an error occurred when initialising any of the the message queues used by the threads
     err = DM_EXEC_Init();
     err |= MTP_EXEC_Init();
+#ifndef REMOVE_DEVICE_BULKDATA
     err |= BDC_EXEC_Init();
+#endif
     if (err != USP_ERR_OK)
     {
         return err;
@@ -391,26 +531,8 @@ int MAIN_Start(char *db_file, bool enable_mem_info)
         return err;
     }
 
-#ifndef DISABLE_STOMP
-    // Start the STOMP connections. This must be done here, before other parts of the data model that require stomp connections
-    // to queue messages (eg object creation/deletion notifications)
-    err = DEVICE_STOMP_StartAllConnections();
-    if (err != USP_ERR_OK)
-    {
-        return err;
-    }
-#endif
-
-#ifdef ENABLE_MQTT
-    // Start the MQTT connections. This must be done here, before other parts of the data model that require MQTT clients
-    // to queue messages (eg object creation/deletion notifications)
-    err = DEVICE_MQTT_StartAllClients();
-    if (err != USP_ERR_OK)
-    {
-
-        return err;
-    }
-#endif
+    // Start all MTP connections
+    DEVICE_CONTROLLER_StartAllMtpClients();
 
     return USP_ERR_OK;
 }
@@ -431,7 +553,10 @@ void MAIN_Stop(void)
 {
     // Free all memory used by USP Agent
     DM_EXEC_Destroy();
+#ifdef REQUIRE_CURL
     curl_global_cleanup();
+#endif
+    USP_MEM_Destroy();
 }
 
 /*********************************************************************//**
@@ -460,14 +585,23 @@ void PrintUsage(char *prog_name)
     printf("--dbfile (-f)     Sets the path of the file to store the database in (default=%s)\n", DEFAULT_DATABASE_FILE);
     printf("--verbose (-v)    Sets the debug verbosity log level: 0=Off, 1=Error(default), 2=Warning, 3=Info\n");
     printf("--prototrace (-p) Enables trace logging of the USP protocol messages\n");
+    printf("--cli (-s)        Sets the path of the Unix domain socket file used for CLI communications\n");
+#ifndef REMOVE_DEVICE_SECURITY
     printf("--authcert (-a)   Sets the path of the PEM formatted file containing a client certificate and private key to authenticate this device with\n");
     printf("--truststore (-t) Sets the path of the PEM formatted file containing trust store certificates\n");
+#endif
     printf("--resetfile (-r)  Sets the path of the text file containing factory reset parameters\n");
     printf("--interface (-i)  Sets the name of the networking interface to use for USP communication\n");
     printf("--meminfo (-m)    Collects and prints information useful to debugging memory leaks\n");
+#ifndef REMOVE_USP_SERVICE
+    printf("--register (-R)   Sets the top-level data model objects to register when acting as a USP Service\n");
+#endif
+#ifdef HAVE_EXECINFO_H
     printf("--error (-e)      Enables printing of the callstack whenever an error is detected\n");
+#endif
     printf("--command (-c)    Sends a CLI command to the running USP Agent and prints the response\n");
     printf("                  To get a list of all CLI commands use '-c help'\n");
+    printf("--plugin (-x)     Specifies the path to a shared object vendor layer plug-in\n");
     printf("\n");
 }
 

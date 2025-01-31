@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2021, Broadband Forum
- * Copyright (C) 2016-2021  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  * Copyright (C) 2020, BT PLC
  *
  * Redistribution and use in source and binary forms, with or without
@@ -41,9 +41,11 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/sysinfo.h>
 
 #include "common_defs.h"
 #include "usp_api.h"
@@ -57,17 +59,19 @@
 #include "uptime.h"
 #include "iso8601.h"
 #include "os_utils.h"
+#include "bdc_exec.h"
 
 
 
 //------------------------------------------------------------------------------
 // Cached version of the endpoint_id, which is populated at boot up by DEVICE_LOCAL_AGENT_SetDefaults()
-static char agent_endpoint_id[MAX_DM_SHORT_VALUE_LEN] = {0};
+static char agent_endpoint_id[MAX_ENDPOINT_ID_LEN] = {0};
 
 //------------------------------------------------------------------------------
 // By default when a stop of USP Agent is scheduled, it just exits rather than rebooting
 exit_action_t scheduled_exit_action = kExitAction_Exit;
 
+#ifndef REMOVE_DEVICE_BOOT_EVENT
 //------------------------------------------------------------------------------
 // Database paths to parameters associated with rebooting and whether firmware has been activated
 char *reboot_cause_path = "Internal.Reboot.Cause";
@@ -76,6 +80,7 @@ static char *reboot_request_instance_path = "Internal.Reboot.RequestInstance";
 static char *last_software_version_path = "Internal.Reboot.LastSoftwareVersion";
 
 static char *local_reboot_cause_str = "LocalReboot";
+#endif
 
 //------------------------------------------------------------------------------
 // Database paths associated with device parameters
@@ -87,9 +92,11 @@ static char *endpoint_id_path = "Device.LocalAgent.EndpointID";
 // Number of seconds after reboot at which USP Agent was started
 static unsigned usp_agent_start_time;
 
+#ifndef REMOVE_DEVICE_BOOT_EVENT
 //------------------------------------------------------------------------------
 // Cause of last reboot, and other variables calculated at Boot-up time related to cause of reboot
-static reboot_info_t reboot_info;
+static reboot_info_t reboot_info = { 0 };
+#endif
 
 //------------------------------------------------------------------------------
 // Variables relating to Dual Stack preference - whether to prefer IPv4 or IPv6 addresses, when both are available eg on an interface or DNS resolution
@@ -97,6 +104,7 @@ char *dual_stack_preference_path = "Internal.DualStackPreference";
 static bool dual_stack_prefer_ipv6 = false;
 
 
+#ifndef REMOVE_DEVICE_SCHEDULE_TIMER
 //------------------------------------------------------------------------------
 // Structure containing input conditions for ScheduleTimer task
 typedef struct
@@ -113,23 +121,34 @@ static char *sched_timer_input_args[] =
     "DelaySeconds",
 };
 
+// Forward declarations for functions related to ScheduleTimer
+int Start_ScheduleTimer(dm_req_t *req, kv_vector_t *input_args, int instance);
+void *ScheduleTimerThreadMain(void *param);
+int Restart_ScheduleTimer(dm_req_t *req, int instance, bool *is_restart, int *err_code, char *err_msg, int err_msg_len, kv_vector_t *output_args);
+#endif
+
 //------------------------------------------------------------------------------
 // Forward declarations. Note these are not static, because we need them in the symbol table for USP_LOG_Callstack() to show them
 int Validate_DualStackPreference(dm_req_t *req, char *value);
 int NotifyChange_DualStackPreference(dm_req_t *req, char *value);
-int GetUpTime(dm_req_t *req, char *buf, int len);
-int ScheduleReboot(dm_req_t *req, char *command_key, kv_vector_t *input_args, kv_vector_t *output_args);
-int ScheduleFactoryReset(dm_req_t *req, char *command_key, kv_vector_t *input_args, kv_vector_t *output_args);
+int GetAgentUpTime(dm_req_t *req, char *buf, int len);
 int GetDefaultOUI(char *buf, int len);
 int GetDefaultSerialNumber(char *buf, int len);
 int GetDefaultEndpointID(char *buf, int len, char *oui, char *serial_number);
-int PopulateRebootInfo(void);
 int GetActiveSoftwareVersion(dm_req_t *req, char *buf, int len);
-int Start_ScheduleTimer(dm_req_t *req, kv_vector_t *input_args, int instance);
-void *ScheduleTimerThreadMain(void *param);
-int Restart_ScheduleTimer(dm_req_t *req, int instance, bool *is_restart, int *err_code, char *err_msg, int err_msg_len, kv_vector_t *output_args);
+
 #ifndef REMOVE_DEVICE_INFO
 int GetHardwareVersion(dm_req_t *req, char *buf, int len);
+int GetKernelUpTime(dm_req_t *req, char *buf, int len);
+#endif
+#ifndef REMOVE_DEVICE_REBOOT
+int ScheduleReboot(dm_req_t *req, char *command_key, kv_vector_t *input_args, kv_vector_t *output_args);
+#endif
+#ifndef REMOVE_DEVICE_FACTORY_RESET
+int ScheduleFactoryReset(dm_req_t *req, char *command_key, kv_vector_t *input_args, kv_vector_t *output_args);
+#endif
+#ifndef REMOVE_DEVICE_BOOT_EVENT
+int PopulateRebootInfo(void);
 #endif
 
 /*********************************************************************//**
@@ -147,51 +166,39 @@ int GetHardwareVersion(dm_req_t *req, char *buf, int len);
 int DEVICE_LOCAL_AGENT_Init(void)
 {
     int err = USP_ERR_OK;
-    int num_protocols = 0;
-    char *protocols[kMtpProtocol_Max];
-    char supported_protocols[MAX_DM_SHORT_VALUE_LEN];
-
-    // Initialise last reboot cause structure
-    memset(&reboot_info, 0, sizeof(reboot_info));
 
     // Register parameters implemented by this component
     // NOTE: Device.LocalAgent.EndpointID is registered in DEVICE_LOCAL_AGENT_RegisterEndpointID()
     err = USP_ERR_OK;
-    err |= USP_REGISTER_VendorParam_ReadOnly("Device.LocalAgent.UpTime", GetUpTime, DM_UINT);
-
-    // Form string containing list of supported protocols
-    #ifndef DISABLE_STOMP
-    protocols[num_protocols++] = "STOMP";
-    #endif
-
-    #ifdef ENABLE_COAP
-    protocols[num_protocols++] = "CoAP";
-    #endif
-
-    #ifdef ENABLE_MQTT
-    protocols[num_protocols++] = "MQTT";
-    #endif
-
-    USP_ASSERT(num_protocols <= kMtpProtocol_Max);
-    TEXT_UTILS_ListToString(protocols, num_protocols, supported_protocols, sizeof(supported_protocols));
+    err |= USP_REGISTER_VendorParam_ReadOnly("Device.LocalAgent.UpTime", GetAgentUpTime, DM_UINT);
 
     // Register supported protocols and software version
-    err |= USP_REGISTER_Param_Constant("Device.LocalAgent.SupportedProtocols", supported_protocols, DM_STRING);
+    err |= USP_REGISTER_Param_SupportedList("Device.LocalAgent.SupportedProtocols", mtp_protocols, NUM_ELEM(mtp_protocols));
     err |= USP_REGISTER_Param_Constant("Device.LocalAgent.SoftwareVersion", AGENT_SOFTWARE_VERSION, DM_STRING);
 
+#ifndef REMOVE_DEVICE_SCHEDULE_TIMER
     // Register ScheduleTimer operation
     err |= USP_REGISTER_AsyncOperation("Device.ScheduleTimer()", Start_ScheduleTimer, Restart_ScheduleTimer);
     err |= USP_REGISTER_OperationArguments("Device.ScheduleTimer()", sched_timer_input_args, NUM_ELEM(sched_timer_input_args), NULL, 0);
+#endif
 
-    // Register Reset and Reboot operations
+#ifndef REMOVE_DEVICE_REBOOT
+    // Register Reboot operation
     err |= USP_REGISTER_SyncOperation("Device.Reboot()", ScheduleReboot);
-    err |= USP_REGISTER_SyncOperation("Device.FactoryReset()", ScheduleFactoryReset);
+#endif
 
+#ifndef REMOVE_DEVICE_FACTORY_RESET
+    // Register Factory Reset operation
+    err |= USP_REGISTER_SyncOperation("Device.FactoryReset()", ScheduleFactoryReset);
+#endif
+
+#ifndef REMOVE_DEVICE_BOOT_EVENT
     // Register parameters associated with tracking the cause of a reboot
-    err |= USP_REGISTER_DBParam_ReadWrite(reboot_cause_path, local_reboot_cause_str, NULL, NULL, DM_STRING);
+    err |= USP_REGISTER_DBParam_ReadWrite(reboot_cause_path, "FactoryReset", NULL, NULL, DM_STRING);
     err |= USP_REGISTER_DBParam_ReadWrite(reboot_command_key_path, "", NULL, NULL, DM_STRING);
     err |= USP_REGISTER_DBParam_ReadWrite(reboot_request_instance_path, "-1", NULL, NULL, DM_INT);
     err |= USP_REGISTER_DBParam_ReadWrite(last_software_version_path, "", NULL, NULL, DM_STRING);
+#endif
 
 #ifndef REMOVE_DEVICE_INFO
     err |= USP_REGISTER_VendorParam_ReadOnly("Device.DeviceInfo.SoftwareVersion", GetActiveSoftwareVersion, DM_STRING);
@@ -199,6 +206,7 @@ int DEVICE_LOCAL_AGENT_Init(void)
     err |= USP_REGISTER_Param_Constant("Device.DeviceInfo.Manufacturer", VENDOR_MANUFACTURER, DM_STRING);
     err |= USP_REGISTER_Param_Constant("Device.DeviceInfo.ModelName", VENDOR_MODEL_NAME, DM_STRING);
     err |= USP_REGISTER_VendorParam_ReadOnly("Device.DeviceInfo.HardwareVersion", GetHardwareVersion, DM_STRING);
+    err |= USP_REGISTER_VendorParam_ReadOnly("Device.DeviceInfo.UpTime", GetKernelUpTime, DM_UINT);
 
     // NOTE: The default values of these database parameters are setup later in DEVICE_LOCAL_AGENT_SetDefaults()
     err |= USP_REGISTER_DBParam_ReadOnly(manufacturer_oui_path, "", DM_STRING);
@@ -241,6 +249,7 @@ int DEVICE_LOCAL_AGENT_SetDefaults(void)
     //-------------------------------------------------------------
     // ManufacturerOUI
     // Exit if unable to get the default value of ManufacturerOUI (ie the value if not overridden by the USP DB)
+    // This is either set by an environment variable or failing that, set by VENDOR_OUI define in vendor_defs.h
     err = GetDefaultOUI(default_value, sizeof(default_value));
     if (err != USP_ERR_OK)
     {
@@ -261,11 +270,12 @@ int DEVICE_LOCAL_AGENT_SetDefaults(void)
     err = DATA_MODEL_GetParameterValue(manufacturer_oui_path, oui, sizeof(oui), 0);
 
 #ifdef REMOVE_DEVICE_INFO
-    // If vendor has not registered Device.DeviceInfo.ManufacturerOUI, then ignore the error, and use the default value
+    // If vendor has not registered Device.DeviceInfo.ManufacturerOUI, then use the default value
     if (err == USP_ERR_INVALID_PATH)
     {
-        USP_LOG_Error("%s: Code configuration error: You must provide an implementation of Device.DeviceInfo.ManufacturerOUI if REMOVE_DEVICE_INFO is defined", __FUNCTION__);
-        return err;
+        USP_LOG_Warning("%s: WARNING: No implementation of Device.DeviceInfo.ManufacturerOUI registered. Using OUI=%s", __FUNCTION__, default_value);
+        USP_STRNCPY(oui, default_value, sizeof(oui));
+        err = USP_ERR_OK;
     }
 #endif
 
@@ -277,6 +287,7 @@ int DEVICE_LOCAL_AGENT_SetDefaults(void)
     //-------------------------------------------------------------
     // SERIAL NUMBER
     // Exit if unable to get the default value of Serial Number (ie the value if not overridden by the USP DB)
+    // This is either set by a vendor hook, failing that by an environment variable, or failing that by the MAC address of the WAN interface
     err = GetDefaultSerialNumber(default_value, sizeof(default_value));
     if (err != USP_ERR_OK)
     {
@@ -297,11 +308,12 @@ int DEVICE_LOCAL_AGENT_SetDefaults(void)
     err = DATA_MODEL_GetParameterValue(serial_number_path, serial_number, sizeof(serial_number), 0);
 
 #ifdef REMOVE_DEVICE_INFO
-    // If vendor has defined REMOVE_DEVICE_INFO but not registered Device.DeviceInfo.SerialNumber, then this is a configuration error
+    // If vendor has not registered Device.DeviceInfo.SerialNumber, then use the default value
     if (err == USP_ERR_INVALID_PATH)
     {
-        USP_LOG_Error("%s: Code configuration error: You must provide an implementation of Device.DeviceInfo.SerialNumber if REMOVE_DEVICE_INFO is defined", __FUNCTION__);
-        return err;
+        USP_LOG_Warning("%s: WARNING: No implementation of Device.DeviceInfo.SerialNumber registered. Using SerialNumber=%s", __FUNCTION__, default_value);
+        USP_STRNCPY(serial_number, default_value, sizeof(serial_number));
+        err = USP_ERR_OK;
     }
 #endif
 
@@ -313,20 +325,21 @@ int DEVICE_LOCAL_AGENT_SetDefaults(void)
     //-------------------------------------------------------------
     // ENDPOINT_ID
     // Exit if unable to get the default value of EndpointID (ie the value if not overridden by the USP DB)
+    // This is either set by a vendor hook, or failing that formed using the OUI and serial numbers retrieved above
     err = GetDefaultEndpointID(default_value, sizeof(default_value), oui, serial_number);
     if (err != USP_ERR_OK)
     {
         return err;
     }
 
-    // Register the default value of EndpointID (if DeviceInfo parameters are being registered by USP Agent core)
+    // Register the default value of Device.LocalAgent.EndpointID
     err = DM_PRIV_ReRegister_DBParam_Default(endpoint_id_path, default_value);
     if (err != USP_ERR_OK)
     {
         return err;
     }
 
-    // Get the actual value of EndpointID
+    // Get the actual value of Device.LocalAgent.EndpointID
     // This may be the value in the USP DB or the default value (if not present in DB)
     err = DATA_MODEL_GetParameterValue(endpoint_id_path, agent_endpoint_id, sizeof(agent_endpoint_id), 0);
     if (err != USP_ERR_OK)
@@ -356,7 +369,9 @@ int DEVICE_LOCAL_AGENT_Start(void)
     // Get the time (after boot) at which USP Agent was started
     usp_agent_start_time = (unsigned)tu_uptime_secs();
 
+#ifndef REMOVE_DEVICE_BOOT_EVENT
     PopulateRebootInfo();
+#endif
 
     // Exit if unable to get the Dual stack preference for IPv4 or IPv6
     err = DATA_MODEL_GetParameterValue(dual_stack_preference_path, value, sizeof(value), 0);
@@ -384,12 +399,15 @@ int DEVICE_LOCAL_AGENT_Start(void)
 **************************************************************************/
 void DEVICE_LOCAL_AGENT_Stop(void)
 {
+#ifndef REMOVE_DEVICE_BOOT_EVENT
     USP_SAFE_FREE(reboot_info.cause);
     USP_SAFE_FREE(reboot_info.command_key);
     USP_SAFE_FREE(reboot_info.cur_software_version);
     USP_SAFE_FREE(reboot_info.last_software_version);
+#endif
 }
 
+#if !defined(REMOVE_DEVICE_REBOOT) || !defined(REMOVE_DEVICE_FACTORY_RESET)
 /*********************************************************************//**
 **
 ** DEVICE_LOCAL_AGENT_ScheduleReboot
@@ -406,6 +424,7 @@ void DEVICE_LOCAL_AGENT_Stop(void)
 **************************************************************************/
 int DEVICE_LOCAL_AGENT_ScheduleReboot(exit_action_t exit_action, char *reboot_cause, char *command_key, int request_instance)
 {
+#ifndef REMOVE_DEVICE_BOOT_EVENT
     int err;
 
     // Exit if unable to persist the cause of reboot
@@ -428,11 +447,16 @@ int DEVICE_LOCAL_AGENT_ScheduleReboot(exit_action_t exit_action, char *reboot_ca
     {
         return err;
     }
+#endif
 
     scheduled_exit_action = exit_action;
+#ifndef REMOVE_DEVICE_BULKDATA
+    BDC_EXEC_ScheduleExit();
+#endif
     MTP_EXEC_ScheduleExit();
     return USP_ERR_OK;
 }
+#endif
 
 /*********************************************************************//**
 **
@@ -458,7 +482,8 @@ exit_action_t DEVICE_LOCAL_AGENT_GetExitAction(void)
 ** DEVICE_LOCAL_AGENT_GetEndpointID
 **
 ** Returns the cached value of the EndpointID of this device
-** NOTE: This function is threadsafe - the value is immutable
+** NOTE: This function is threadsafe as the value does not change after being
+** determined. It is determined after VENDOR_Init(), but before VENDOR_Start() is called
 **
 ** \param   None
 **
@@ -470,6 +495,7 @@ char *DEVICE_LOCAL_AGENT_GetEndpointID(void)
     return agent_endpoint_id;
 }
 
+#ifndef REMOVE_DEVICE_BOOT_EVENT
 /*********************************************************************//**
 **
 ** DEVICE_LOCAL_AGENT_GetRebootInfo
@@ -485,6 +511,7 @@ void DEVICE_LOCAL_AGENT_GetRebootInfo(reboot_info_t *info)
 {
     memcpy(info, &reboot_info, sizeof(reboot_info_t));
 }
+#endif
 
 /*********************************************************************//**
 **
@@ -546,7 +573,7 @@ int NotifyChange_DualStackPreference(dm_req_t *req, char *value)
     // Set local cached copy of this value
     if (strcmp(value, "IPv6")==0)
     {
-        // Prefer IPv6, if interface or DNS resolution has an IPv4 and IPv4 address
+        // Prefer IPv6, if interface or DNS resolution has an IPv4 and IPv6 address
         dual_stack_prefer_ipv6 = true;
     }
     else
@@ -560,9 +587,9 @@ int NotifyChange_DualStackPreference(dm_req_t *req, char *value)
 
 /*********************************************************************//**
 **
-** GetUpTime
+** GetAgentUpTime
 **
-** Gets the number of seconds that the agent software has been running
+** Gets the number of seconds that the agent software has been running (Device.LocalAgent.UpTime)
 **
 ** \param   req - pointer to structure identifying the parameter
 ** \param   buf - pointer to buffer into which to return the value of the parameter (as a textual string)
@@ -571,13 +598,48 @@ int NotifyChange_DualStackPreference(dm_req_t *req, char *value)
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int GetUpTime(dm_req_t *req, char *buf, int len)
+int GetAgentUpTime(dm_req_t *req, char *buf, int len)
 {
     val_uint = (unsigned)tu_uptime_secs() - usp_agent_start_time;
 
     return USP_ERR_OK;
 }
 
+#ifndef REMOVE_DEVICE_INFO
+/*********************************************************************//**
+**
+** GetKernelUpTime
+**
+** Gets the total number of seconds that the cpe has been running (Device.DeviceInfo.UpTime)
+**
+** \param   req - pointer to structure identifying the parameter
+** \param   buf - pointer to buffer into which to return the value of the parameter (as a textual string)
+** \param   len - length of buffer in which to return the value of the parameter
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int GetKernelUpTime(dm_req_t *req, char *buf, int len)
+{
+    struct sysinfo info;
+    int err;
+
+    // Exit if unable to get the uptime of the Linux kernel
+    err = sysinfo(&info);
+    if (err != 0)
+    {
+        USP_ERR_ERRNO("sysinfo", errno);
+        return USP_ERR_INTERNAL_ERROR;
+    }
+
+    val_uint = (unsigned)info.uptime;
+
+    return USP_ERR_OK;
+}
+#endif
+
+
+#ifndef REMOVE_DEVICE_REBOOT
 /*********************************************************************//**
 **
 ** ScheduleReboot
@@ -605,7 +667,9 @@ int ScheduleReboot(dm_req_t *req, char *command_key, kv_vector_t *input_args, kv
 
     return err;
 }
+#endif
 
+#ifndef REMOVE_DEVICE_FACTORY_RESET
 /*********************************************************************//**
 **
 ** ScheduleFactoryReset
@@ -633,6 +697,7 @@ int ScheduleFactoryReset(dm_req_t *req, char *command_key, kv_vector_t *input_ar
 
     return err;
 }
+#endif
 
 /*********************************************************************//**
 **
@@ -725,8 +790,8 @@ int GetDefaultSerialNumber(char *buf, int len)
     for (i=0; i<MAC_ADDR_LEN; i++)
     {
         val = mac_addr[i];
-        *p++ = TEXT_UTILS_ValueToHexDigit( (val & 0xF0) >> 4 );
-        *p++ = TEXT_UTILS_ValueToHexDigit( val & 0x0F );
+        *p++ = TEXT_UTILS_ValueToHexDigit( (val & 0xF0) >> 4, USE_UPPERCASE_HEX_DIGITS );
+        *p++ = TEXT_UTILS_ValueToHexDigit( val & 0x0F, USE_UPPERCASE_HEX_DIGITS );
     }
     *p = '\0';
 
@@ -772,8 +837,8 @@ int GetDefaultEndpointID(char *buf, int len, char *oui, char *serial_number)
 
     // Percent encode the OUI and serial number
     #define SAFE_CHARS "-._"
-    TEXT_UTILS_PercentEncodeString(oui, oui_encoded, sizeof(oui_encoded), SAFE_CHARS);
-    TEXT_UTILS_PercentEncodeString(serial_number, serial_number_encoded, sizeof(serial_number_encoded), SAFE_CHARS);
+    TEXT_UTILS_PercentEncodeString(oui, oui_encoded, sizeof(oui_encoded), SAFE_CHARS, USE_UPPERCASE_HEX_DIGITS);
+    TEXT_UTILS_PercentEncodeString(serial_number, serial_number_encoded, sizeof(serial_number_encoded), SAFE_CHARS, USE_UPPERCASE_HEX_DIGITS);
 
     // Form the final endpoint_id
     USP_SNPRINTF(buf, len, "os::%s-%s", oui_encoded, serial_number_encoded);
@@ -782,6 +847,7 @@ int GetDefaultEndpointID(char *buf, int len, char *oui, char *serial_number)
 }
 
 
+#ifndef REMOVE_DEVICE_BOOT_EVENT
 /*********************************************************************//**
 **
 ** PopulateRebootInfo
@@ -801,6 +867,7 @@ int PopulateRebootInfo(void)
     char last_value[MAX_DM_SHORT_VALUE_LEN];
     char cur_value[MAX_DM_SHORT_VALUE_LEN];
     char *last_version;
+    modify_firmware_updated_cb_t  modify_firmware_updated_cb;
 
     // Set the default to indicate that the firmware image was not updated
     reboot_info.is_firmware_updated = false;
@@ -904,8 +971,16 @@ int PopulateRebootInfo(void)
         reboot_info.is_firmware_updated = true;
     }
 
+    // Modify the firmware updated flag using a core vendor hook (if registered)
+    modify_firmware_updated_cb = vendor_hook_callbacks.modify_firmware_updated_cb;
+    if (modify_firmware_updated_cb != NULL)
+    {
+        modify_firmware_updated_cb( &reboot_info.is_firmware_updated );
+    }
+
     return USP_ERR_OK;
 }
+#endif
 
 #ifndef REMOVE_DEVICE_INFO
 /*********************************************************************//**
@@ -979,6 +1054,7 @@ int GetHardwareVersion(dm_req_t *req, char *buf, int len)
 }
 #endif // REMOVE_DEVICE_INFO
 
+#ifndef REMOVE_DEVICE_SCHEDULE_TIMER
 /*********************************************************************//**
 **
 ** Start_ScheduleTimer
@@ -1033,7 +1109,7 @@ int Start_ScheduleTimer(dm_req_t *req, kv_vector_t *input_args, int instance)
 
     // Exit if unable to start a thread to perform this operation
     // NOTE: ownership of input conditions passes to the thread
-    err = OS_UTILS_CreateThread(ScheduleTimerThreadMain, cond);
+    err = OS_UTILS_CreateThread("ScheduleTimer", ScheduleTimerThreadMain, cond);
     if (err != USP_ERR_OK)
     {
         goto exit;
@@ -1113,3 +1189,4 @@ void *ScheduleTimerThreadMain(void *param)
 
     return NULL;
 }
+#endif

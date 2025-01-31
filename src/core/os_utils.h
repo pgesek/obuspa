@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019, Broadband Forum
- * Copyright (C) 2016-2019  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -50,12 +50,14 @@
 
 //-------------------------------------------------------------------------
 // API functions
-int OS_UTILS_CreateThread(void *(* start_routine)(void *), void *args);
+int OS_UTILS_CreateThread(const char* name, void *(* start_routine)(void *), void *args);
 void OS_UTILS_SetDataModelThread(void);
 bool OS_UTILS_IsDataModelThread(const char *caller, bool print_warning);
 int OS_UTILS_InitMutex(pthread_mutex_t *mutex);
 void OS_UTILS_LockMutex(pthread_mutex_t *mutex);
 void OS_UTILS_UnlockMutex(pthread_mutex_t *mutex);
+int OS_UTILS_CreateDirFromFilename(char *filename);
+time_t OS_UTILS_TimeNow(void);
 
 #endif
 

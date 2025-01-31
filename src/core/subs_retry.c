@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2021, Broadband Forum
- * Copyright (C) 2016-2021  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -49,6 +49,10 @@
 #include "device.h"
 #include "sync_timer.h"
 #include "retry_wait.h"
+
+#if defined(E2ESESSION_EXPERIMENTAL_USP_V_1_2)
+#include "e2e_context.h"
+#endif
 
 //------------------------------------------------------------------------
 // Structure containing NotifyRequest message to retry sending and associated state machine
@@ -329,7 +333,7 @@ void SubsRetryExec(int id)
     subs_retry_t *sr;
     time_t cur_time;
     char buf[MAX_ISO8601_LEN];
-    mtp_reply_to_t mtp_reply_to = {0};  // Ensures mtp_reply_to.is_reply_to_specified=false
+    mtp_conn_t mtp_conn = {0};  // Ensures mtp_conn.is_reply_to_specified=false
 
     cur_time = time(NULL);
     USP_ASSERT(cur_time >= first_retry_time);
@@ -350,8 +354,19 @@ void SubsRetryExec(int id)
             // Determine if it is time to try resending the message
             if (cur_time >= sr->next_retry_time)
             {
+                // Marshal parameters to pass to MSG_HANDLER_QueueUspRecord()
+                usp_send_item_t usp_send_item;
+                MSG_HANDLER_UspSendItem_Init(&usp_send_item);
+                usp_send_item.usp_msg_type = USP__HEADER__MSG_TYPE__NOTIFY;
+                usp_send_item.msg_packed = sr->pbuf;
+                usp_send_item.msg_packed_size = sr->pbuf_len;
+#if defined(E2ESESSION_EXPERIMENTAL_USP_V_1_2)
+                usp_send_item.curr_e2e_session = DEVICE_CONTROLLER_FindE2ESessionByEndpointId(sr->dest_endpoint);
+                usp_send_item.usp_msg = NULL;
+#endif
+
                 // Try resending the saved serialized USP message
-                MSG_HANDLER_QueueUspRecord(USP__HEADER__MSG_TYPE__NOTIFY, sr->dest_endpoint, sr->pbuf, sr->pbuf_len, sr->msg_id, &mtp_reply_to, sr->retry_expiry_time);
+                MSG_HANDLER_QueueUspRecord(&usp_send_item, sr->dest_endpoint, sr->msg_id, &mtp_conn, sr->retry_expiry_time);
 
                 // Calculate next time until this message is retried
                 sr->retry_count++;
@@ -537,5 +552,10 @@ void GarbageCollectSubsRetry(void)
 
     // Store the number of valid entries left in the vector
     subs_retry.num_entries = j;
-}
 
+    // Free the vector, if it now has no entries
+    if (subs_retry.num_entries == 0)
+    {
+        USP_SAFE_FREE(subs_retry.vector);  // This will also set the vector to NULL
+    }
+}

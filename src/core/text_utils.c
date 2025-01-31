@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2021, Broadband Forum
- * Copyright (C) 2016-2021  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -39,8 +39,15 @@
  *
  */
 
+#include "vendor_defs.h"   // For REMOVE_DEVICE_SECURITY
+
+#ifndef REMOVE_DEVICE_SECURITY
+#include <openssl/evp.h>
+#endif
+
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>  // For strcasecmp
 
 #include "common_defs.h"
 #include "str_vector.h"
@@ -178,6 +185,71 @@ int TEXT_UTILS_StringToUnsignedLongLong(char *str, unsigned long long *value)
 
 /*********************************************************************//**
 **
+** TEXT_UTILS_StringToLongLong
+**
+** Converts a string to a long long (64 bit)
+**
+** \param   str - string containing value to convert
+** \param   value - pointer to variable to return converted value in
+**
+** \return  USP_ERR_OK if converted successfully
+**          USP_ERR_INVALID_TYPE if unable to convert the string
+**
+**************************************************************************/
+int TEXT_UTILS_StringToLongLong(char *str, long long *value)
+{
+    char *endptr = NULL;
+
+    // Do not allow the largest negative number as it is so large it is interpreted as +9223372036854775807 by sprintf() etc
+    if (strcmp(str, "-9223372036854775808")==0)
+    {
+        USP_ERR_SetMessage("%s: Largest negative long '%s' is not supported", __FUNCTION__, str);
+        return USP_ERR_INVALID_TYPE;
+    }
+
+    // Exit if unable to convert
+    errno = 0;
+    *value = strtoll(str, &endptr, 10);
+    if ((endptr == NULL) || (*endptr != '\0') || (errno != 0))
+    {
+        USP_ERR_SetMessage("%s: '%s' is not a valid long number", __FUNCTION__, str);
+        return USP_ERR_INVALID_TYPE;
+    }
+
+    return USP_ERR_OK;
+}
+
+/*********************************************************************//**
+**
+** TEXT_UTILS_StringToDouble
+**
+** Converts a string to a double
+**
+** \param   str - string containing value to convert
+** \param   value - pointer to variable to return converted value in
+**
+** \return  USP_ERR_OK if converted successfully
+**          USP_ERR_INVALID_TYPE if unable to convert the string
+**
+**************************************************************************/
+int TEXT_UTILS_StringToDouble(char *str, double *value)
+{
+    char *endptr = NULL;
+
+    // Exit if unable to convert
+    errno = 0;
+    *value = strtod(str, &endptr);
+    if ((endptr == NULL) || (*endptr != '\0') || (errno != 0))
+    {
+        USP_ERR_SetMessage("%s: '%s' is not a valid decimal number", __FUNCTION__, str);
+        return USP_ERR_INVALID_TYPE;
+    }
+
+    return USP_ERR_OK;
+}
+
+/*********************************************************************//**
+**
 ** TEXT_UTILS_StringToBool
 **
 ** Converts a string to a boolean type
@@ -292,6 +364,54 @@ char *TEXT_UTILS_EnumToString(int value, const enum_entry_t *enums, int num_enum
     return "UNKNOWN";
 }
 
+/*********************************************************************//**
+**
+** TEXT_UTILS_EnumListToString
+**
+** Converts an enumerated list to a comma separated string representation
+**
+** \param   enums - pointer to conversion table containing a list of enumerations and their associated string representation
+** \param   num_enums - number of enumerations in the table
+** \param   buf - buffer in which to write output string
+**
+** \return  pointer to output buffer
+**
+**************************************************************************/
+char *TEXT_UTILS_EnumListToString(const enum_entry_t *enums, int num_enums, char *buf, int len)
+{
+    int i;
+    char *p;
+    int chars_written;
+    const enum_entry_t *e;
+
+    // Default to empty string, if no items
+    p = buf;
+    *p = '\0';
+
+    // Iterate over all enums to add, forming a comma separated string
+    for (i=0; i<num_enums; i++)
+    {
+        // Add comma before every enum (apart from the first)
+        if (p != buf)
+        {
+            chars_written = USP_SNPRINTF(p, len, "%s", ", ");
+            p += chars_written;
+            len -= chars_written;
+        }
+
+        // Add the enum (if it's not empty)
+        e = &enums[i];
+        if (e->name[0] != '\0')
+        {
+            chars_written = USP_SNPRINTF(p, len, "%s", e->name);
+            p += chars_written;
+            len -= chars_written;
+        }
+    }
+
+    return buf;
+}
+
 /******************************************************************//**
 **
 ** TEXT_UTILS_StringToDateTime
@@ -390,6 +510,64 @@ int TEXT_UTILS_StringToBinary(char *str, unsigned char *buf, int len, int *bytes
     *bytes_written = num_bytes;
     return USP_ERR_OK;
 }
+
+#ifndef REMOVE_DEVICE_SECURITY
+/*********************************************************************//**
+**
+** TEXT_UTILS_Base64StringToBinary
+**
+** Converts a Base64 encoded string into its binary format in a buffer
+** NOTE: Copes with embedded CR/LF and space/tabs
+**
+** \param   str - pointer to input string to convert (in base64 format)
+** \param   buf - pointer to buffer in which to write the binary data
+** \param   len - length of the binary buffer
+** \param   bytes_written - pointer to variable in which to return the number of bytes written into the buffer, or NULL if not required
+**
+** \return  USP_ERR_OK if successful.
+**          USP_ERR_INVALID_TYPE if unable to convert the string
+**
+**************************************************************************/
+int TEXT_UTILS_Base64StringToBinary(char *str, unsigned char *buf, int len, int *bytes_written)
+{
+    int err = USP_ERR_OK;
+    int original_len;
+    char *stripped = NULL;
+    int stripped_len;
+    int output_len;
+
+    // Strip the input string of CR/LF and tab/space.
+    // This is necessary because the OpenSSL conversion function does not cope with these characters correctly
+    // NOTE: This may be fixed in later versions of OpenSSL (after 1.1.1c) as the documentation now suggests this stage is not required
+    original_len = strlen(str) + 1;   // Plus 1 to include NULL terminator
+    stripped = USP_MALLOC(original_len);
+    TEXT_UTILS_StripChars("\n\r\t ", str, stripped, original_len);
+
+    stripped_len = strlen(stripped);
+    USP_ASSERT(len > (stripped_len*3)/4 );  // Ensure that output buffer won't overflow
+
+    // Exit if failed to decode the stripped input
+    output_len = EVP_DecodeBlock(buf, (const unsigned char *)stripped, stripped_len);
+    if (output_len == -1)
+    {
+        USP_ERR_SetMessage("%s: Unable to convert base64 encoded string", __FUNCTION__);
+        err = USP_ERR_INVALID_TYPE;
+        goto exit;
+    }
+
+    // Return the number of bytes converted (if required)
+    if (bytes_written != NULL)
+    {
+        *bytes_written = output_len;
+    }
+
+    err = USP_ERR_OK;
+
+exit:
+    USP_SAFE_FREE(stripped);
+    return err;
+}
+#endif
 
 /*********************************************************************//**
 **
@@ -501,7 +679,6 @@ void TEXT_UTILS_SplitString(char *str, str_vector_t *sv, char *separator)
     USP_STRNCPY(buf, str, sizeof(buf));
 
     // Iterate over all strings delimited by the separator
-    // 2DO RH: This function can be made to ignore separators present in the string within quotes by creating a special version of strstr
     sep_len = strlen(separator);
     start = buf;
     end = TEXT_UTILS_StrStr(start, separator);
@@ -567,7 +744,7 @@ void TEXT_UTILS_StrncpyLen(char *dst, int dst_len, char *src, int src_len)
 **       This is useful for eg ServerSelection diagnostics driven from USP Agent CLI, as HostList also
 **       contains the separator character (',')
 **
-** \param   haystack - string to searh in
+** \param   haystack - string to search in
 ** \param   needle - string to search for
 **
 ** \return  Pointer to the beginning of the needle string found (in haystack) or NULL if no string found
@@ -616,6 +793,44 @@ char *TEXT_UTILS_StrStr(char *haystack, char *needle)
 
 /*********************************************************************//**
 **
+** TEXT_UTILS_StringTailCmp
+**
+** Detemines whether the tail end of haystack matches needle
+**
+** \param   haystack - string whose tail end we want to match
+** \param   needle - string to test for in the tail end of haystack
+**
+** \return  0 if the the tail end of haystack matches needle, 1 if they do not match
+**
+**************************************************************************/
+int TEXT_UTILS_StringTailCmp(char *haystack, char *needle)
+{
+    int len_haystack;
+    int len_needle;
+    char *tail;
+
+    len_haystack = strlen(haystack);
+    len_needle = strlen(needle);
+
+    // Exit if the needle cannot be the tail of the haystack, because it's a longer string
+    if (len_needle > len_haystack)
+    {
+        return 1;
+    }
+
+    // Exit if the tail of the haystack id not equal to needle
+    tail = &haystack[len_haystack - len_needle];
+    if (strcmp(tail, needle) != 0)
+    {
+        return 1;
+    }
+
+    // If the code gets here, then the tail of haystack matches needle
+    return 0;
+}
+
+/*********************************************************************//**
+**
 ** TEXT_UTILS_SplitPath
 **
 ** Splits the specified data model path into an object path (returned in a buffer) and the parameter/event/operation name
@@ -658,59 +873,59 @@ char *TEXT_UTILS_SplitPath(char *path, char *buf, int len)
 
 /*********************************************************************//**
 **
-** TEXT_UTILS_SplitPathAtSeparator
+** TEXT_UTILS_IsPathMatch
 **
-** Splits the specified data model path into an object path (returned in a buffer) and the parameter/event/operation name
-** The position at where to split is based on a count of the number of separators ('.') to include in the object portion
+** Determines whether the specified data model absolute path matches that specified by the path specification
+** The path specification may be an absolute path, a wildcarded path, a partial path or a wildcarded path with some instance numbers
 **
-** \param   path - pointer to data model parameter to split
-** \param   buf - pointer to buffer in which to return the path of the parent object of the parameter
-** \param   len - length of the return buffer
-** \param   separator_split - count of number of separators included in the 'object' portion of the path
+** \param   path - absolute path (ie containing instance numbers) to match
+** \param   path_spec - specification of the path to match
 **
-** \return  pointer to parameter name - this is within the original 'path' input buffer
+** \return  None
 **
 **************************************************************************/
-char *TEXT_UTILS_SplitPathAtSeparator(char *path, char *buf, int len, int separator_split)
+bool TEXT_UTILS_IsPathMatch(char *path, char *path_spec)
 {
     char *p;
-    int size;
+    char *q;
 
-    // If no split is specified, then just split on the last object in the path
-    // NOTE: This maybe the case if the path was fully specified and did not require any resolution
-    if (separator_split == 0)
+    p = path_spec;
+    q = path;
+    while (*p != '\0')
     {
-        return TEXT_UTILS_SplitPath(path, buf, len);
-    }
-
-    // Skip to split point by counting separators
-    p = path;
-    while (separator_split > 0)
-    {
-        // Skip to the next separator
-        p = strchr(p, '.');
-
-        // If the number of separators to skip is greater than the number in the path string, then just split on the last object in the path
-        // NOTE: This should never occur (and does not in automated tests), however leaving code in for safety's sake
-        if (p == NULL)
+        if (*p == *q)
         {
-            return TEXT_UTILS_SplitPath(path, buf, len);
+            // Skip matching characters
+            p++;
+            q++;
         }
-
-        p++;    // Skip the '.' itself
-        separator_split--;
+        else if (*p == '*')
+        {
+            // Skip instance numbers matched by wildcard
+            p++;
+            while (IS_NUMERIC(*q))
+            {
+                q++;
+            }
+        }
+        else
+        {
+            // Otherwise exit if characters don't match
+            return false;
+        }
     }
 
-    // If the code gets here, p points to the point at which we want to split the string
+    // If the code gets here, then the path matched the characters in the path spec
+    // However the path could still contain characters at the end which do not match the path spec
+    // eg Device.11 should not match Device.1, and Device.WiFi should not match Device.W
+    // NOTE: This is only an issue if the path spec does not end in '.'
+    p--;
+    if ((*p != '.') && (*q != '\0') && (*q != '.'))
+    {
+        return false;
+    }
 
-    // Copy the left-hand-side into the return buffer
-    size = p - path;
-    size = MIN(size, len-1);
-    memcpy(buf, path, size);
-    buf[size] = '\0';
-
-    // Return a pointer to the right-hand-side
-    return p;
+    return true;
 }
 
 /*********************************************************************//**
@@ -899,6 +1114,83 @@ char *TEXT_UTILS_TrimBuffer(char *buf)
 
 /*********************************************************************//**
 **
+** TEXT_UTILS_TrimDelimitedBuffer
+**
+** Trims the string in a buffer of leading/trailing whitespace and any quotes/brackets/braces etc by
+** truncating the string in the buffer and returning a new pointer to the start of the string in the buffer
+**
+** \param   buf - pointer to buffer containing string to trim
+** \param   delimiters - pointer to string containing two characters representing the delimiters
+**                       to remove from the start and end of the string eg [] or ""
+**
+** \return  pointer to string in buffer
+**
+**************************************************************************/
+char *TEXT_UTILS_TrimDelimitedBuffer(char *buf, char *delimiters)
+{
+    char *p;
+    int len;
+
+    // Strip leading/trailing whitespace from buffer
+    p = TEXT_UTILS_TrimBuffer(buf);
+
+    // Strip delimiters (if present) from buffer
+    len = strlen(p);
+    if ((p[0] == delimiters[0]) && (p[len-1] == delimiters[1]))
+    {
+        p[len-1] = '\0';
+        p++;
+    }
+
+    return p;
+}
+
+/*********************************************************************//**
+**
+** TEXT_UTILS_StripChars
+**
+** Forms the destination string by removing the specified characters from the input string
+** NOTE: Caller must ensure that destination buffer is large enough. If not, converted string is truncated.
+**
+** \param   strip_chars - string containing characters to remove from the src string
+** \param   src - pointer to string to convert
+** \param   dest - pointer to buffer in which to return the stripped string
+** \param   dest_len - length of buffer in which to return the stripped string
+**
+** \return  pointer to string in buffer
+**
+**************************************************************************/
+void TEXT_UTILS_StripChars(char *strip_chars, char *src, char *dest, int dest_len)
+{
+    char c;
+
+    // Iterate over all characters in the src string
+    c = *src++;
+    while (c != '\0')
+    {
+        // Copy from src to dest, if current char is not one of the ones being stripped
+        if (strchr(strip_chars, c) == NULL)
+        {
+            *dest++ = c;
+            dest_len--;
+
+            // Exit loop, if only one character left in destination buffer, because we need to use that to
+            // NULL terminate the destination string
+            if (dest_len == 1)
+            {
+                break;
+            }
+        }
+
+        // Move to next char
+        c = *src++;
+    }
+
+    *dest = '\0';
+}
+
+/*********************************************************************//**
+**
 ** TEXT_UTILS_PercentEncodeString
 **
 ** Converts any non-alphanumeric characters, which are also not in the specified set of safe characters, to percent encoded characters
@@ -907,11 +1199,12 @@ char *TEXT_UTILS_TrimBuffer(char *buf)
 ** \param   dst - pointer to buffer in which to store the percent encoded output string
 ** \param   dst_len - length of buffer in which to store the percent encoded output string
 ** \param   safe_chars - characters which should not be percent encoded (these are in addition to alphanumeric chars, which are never percent encoded)
+** \param   flags - flags controlling the encoding e.g. USE_LOWERCASE_HEX_DIGITS
 **
 ** \return  None
 **
 **************************************************************************/
-void TEXT_UTILS_PercentEncodeString(char *src, char *dst, int dst_len, char *safe_chars)
+void TEXT_UTILS_PercentEncodeString(char *src, char *dst, int dst_len, char *safe_chars, unsigned flags)
 {
     char c;
     bool is_percent_encode;
@@ -945,8 +1238,8 @@ void TEXT_UTILS_PercentEncodeString(char *src, char *dst, int dst_len, char *saf
         if (is_percent_encode)
         {
             *dst++ = '%';
-            *dst++ = TEXT_UTILS_ValueToHexDigit( BITS(7, 4, c));
-            *dst++ = TEXT_UTILS_ValueToHexDigit( BITS(3, 0, c));
+            *dst++ = TEXT_UTILS_ValueToHexDigit( BITS(7, 4, c), flags);
+            *dst++ = TEXT_UTILS_ValueToHexDigit( BITS(3, 0, c), flags);
         }
         else
         {
@@ -1175,11 +1468,12 @@ int TEXT_UTILS_HexDigitToValue(char c)
 ** Converts the specified value into a hex character (0-F)
 **
 ** \param   nibble - value to convert (0-15)
+** \param   flags - flags controlling the encoding e.g. USE_LOWERCASE_HEX_DIGITS
 **
 ** \return  value of hex digit (nibble), or 'X' if unable to convert the value
 **
 **************************************************************************/
-char TEXT_UTILS_ValueToHexDigit(int nibble)
+char TEXT_UTILS_ValueToHexDigit(int nibble, unsigned flags)
 {
     if ((nibble >=0) && (nibble <=9))
     {
@@ -1188,7 +1482,14 @@ char TEXT_UTILS_ValueToHexDigit(int nibble)
 
     if ((nibble >= 10) && (nibble <=15))
     {
-        return nibble - 10 + 'A';
+        if (flags & USE_LOWERCASE_HEX_DIGITS)
+        {
+            return nibble - 10 + 'a';
+        }
+        else
+        {
+            return nibble - 10 + 'A';
+        }
     }
 
     // If the code gets here then the digit could not be converted
@@ -1265,6 +1566,107 @@ void TEXT_UTILS_PathToSchemaForm(char *path, char *buf, int len)
 
 exit:
     *buf = '\0';        // Ensure buffer is zero terminated
+}
+
+/*********************************************************************//**
+**
+** TEXT_UTILS_SearchExpressionsToWildcards
+**
+** Copies the path into the output buffer, replacing any search expressions with wildcards
+** The output path can then be used to lookup the data model node using DM_PRIV_GetNodeFromPath()
+**
+** \param   src - data model path to replace search expressions with wildcards
+** \param   dest - buffer in which to copy the input, replacing search expressions with wildcards
+** \param   len - length of destination buffer
+**
+** \return  Pointer to buffer if successfully converted, or NULL, if the path contained a syntactically incorrect search expression
+**
+**************************************************************************/
+char *TEXT_UTILS_SearchExpressionsToWildcards(char *src, char *dest, int len)
+{
+    char c;
+    char *buf = dest;       // Save off a pointer to the start of the buffer, so that we can return it if successful
+
+    c = *src++;
+    while (c != '\0')
+    {
+        if (c == '[')
+        {
+            // Skip to after ']', exiting if search expression is not terminated
+            src = strchr(src, ']');
+            if (src == NULL)
+            {
+                return NULL;
+            }
+            src++;
+
+            // Replace ']' with '*'
+            c = '*';
+        }
+
+        // Copy the character into the buffer, and move to the next input character
+        *dest++ = c;
+        len--;
+        c = *src++;
+
+        // Exit if only space in the output buffer for nul terminator
+        if (len == 1)
+        {
+            goto exit;
+        }
+    }
+
+exit:
+    *dest = '\0';
+    return buf;
+
+}
+
+/*********************************************************************//**
+**
+** TEXT_UTILS_SchemaFormToPath
+**
+** Converts an path in supported data model notation into a wildcarded path
+** by replacing "{i}" with "*"
+**
+** \param   schema_path - Supported data model path (contains {i})
+** \param   buf - pointer to buffer in which to return the wildcarded path
+** \param   len - length of buffer in which to return the wildcarded path
+**
+** \return  None
+**
+**************************************************************************/
+void TEXT_UTILS_SchemaFormToPath(char *schema_path, char *buf, int len)
+{
+    char c;
+
+    // Iterate over all characters in the path
+    c = *schema_path++;
+    while (c != '\0')
+    {
+        // Skip any instance separator, replacing them with a wildcard character
+        if ((c == '{') && (schema_path[0] == 'i') && (schema_path[1] == '}'))
+        {
+            schema_path += 2;
+            c = '*';
+        }
+
+        // Copy across the characters from the schema path
+        *buf++ = c;
+        len--;
+
+        // Exit the loop, if there's only enough space left for the nul terminator
+        if (len == 1)
+        {
+            break;
+        }
+
+        // Read next character from the schema path
+        c = *schema_path++;
+    }
+
+    // Ensure buffer is zero terminated
+    *buf = '\0';
 }
 
 /*********************************************************************//**
@@ -1733,6 +2135,93 @@ void TestPercentEncodeString(void)
         if (strcmp(buf, percent_encode_string_test_cases[i+1]) != 0)
         {
             printf("ERROR: [%d] Test case result for '%s' is '%s' (expected '%s')\n", i/2, percent_encode_string_test_cases[i], buf, percent_encode_string_test_cases[i+1]);
+        }
+    }
+}
+#endif
+
+//------------------------------------------------------------------------------------------
+// Code to test the TEXT_UTILS_IsPathMatch() function
+#if 0
+char *positive_is_path_match_test_cases[] =
+{
+    // Path                                 // Path spec
+    "Device.Test.ParamA",                   "Device.Test.ParamA",
+    "Device.Test.1.ParamA",                 "Device.Test.1.ParamA",
+    "Device.Test.2.ParamA",                 "Device.Test.*.ParamA",
+    "Device.Test.3.ParamA",                 "Device.Test",
+    "Device.Test.3.ParamA",                 "Device.Test.",
+    "Device.Test.4.ParamA",                 "Device.Test.4",
+    "Device.Test.4.ParamA",                 "Device.Test.4.",
+    "Device.Test.5.ObjectA.1.ParamA",       "Device.Test.5.",
+    "Device.Test.6.ObjectA.2.ParamA",       "Device.Test.6.ObjectA.*.ParamA",
+    "Device.Test.7.ObjectA.3.ParamA",       "Device.Test.7.ObjectA.*.",
+    "Device.Test.7.ObjectA.3.ParamA",       "Device.Test.7.ObjectA.*",
+    "Device.Test.8.ObjectA.4.ParamA",       "Device.Test.*.ObjectA.4",
+    "Device.Test.9.ObjectA.10.ParamA",      "Device.Test.*.ObjectA.*.",
+    "Device.Test.10.ObjectA.11.ParamA",     "Device.Test.*.ObjectA.*",
+    "Device.Test.12.ObjectA.13.Cmd()",      "Device.Test.*.ObjectA.13.",
+    "Device.Test.945.ObjectA.946.Cmd1()",   "Device.Test.*.ObjectA.",
+    "Device.Test.945.ObjectA.946.Cmd1()",   "Device.Test.945.ObjectA.*.Cmd1()",
+    "Device.Test.765.ObjectA.375.Cmd1()",   "Device.Test.765.ObjectA.375.Cmd1()",
+    "Device.Test.12.ObjectA.13.Event!",      "Device.Test.*.ObjectA.13.",
+    "Device.Test.945.ObjectA.946.Event1!",   "Device.Test.*.ObjectA.",
+    "Device.Test.945.ObjectA.946.Event1!",   "Device.Test.945.ObjectA.*.Event1!",
+    "Device.Test.765.ObjectA.375.Event1!",   "Device.Test.765.ObjectA.375.Event1!",
+    "Device.Test.765.ObjectA.375.Event1!",   "Device.Test.*.ObjectA.375.Event1!",
+    "Device.Test.765.ObjectA.375.Event1!",   "Device.Test.*.ObjectA.*.Event1!",
+    "Device.Test.765.ObjectA1.375.Event1!",   "Device.Test.*.ObjectA1.375.Event1!",
+};
+
+char *negative_is_path_match_test_cases[] =
+{
+    // Path                                 // Path spec
+    "Device.Test.ParamA",                   "Device.Test.ParamX",
+    "Device.Test.1.ParamA",                 "Device.Test.2.ParamA",
+    "Device.Test.1.ParamA",                 "Device.TestA.",
+    "Device.Test.1.ParamA",                 "Device.Test.1.ParamA.",
+    "Device.Test.1.ParamA",                 "Device.Test.1.ParamA.ParamB",
+    "Device.Test.5.ObjectA.1.ParamA",       "Device.Test.4.",
+    "Device.Test.5.ObjectA.1.ParamA",       "Device.Test.4.",
+    "Device.Test.5.ObjectA.1.ParamA",       "Device.Test.5.ObjectB.",
+    "Device.Test.5.ObjectA.1.ParamA",       "Device.Test.*.ObjectA.2.ParamA",
+    "Device.Test.5.ObjectA.1.ParamA",       "Device.Test.*.ObjectA.2.",
+    "Device.Test.9.ObjectA.10.ParamA",      "Device.Test.9.ObjectA.1",
+    "Device.Test.9.ObjectA.10.ParamA",      "Device.Test.9.ObjectA.1.",
+    "Device.Test.9.ObjectA.10.ParamA",      "Device.Test.*.ObjectA.11.Param",
+    "Device.Test.99.ObjectA.10.ParamA",     "Device.Test.9.ObjectA.*.Param",
+    "Device.Test.99.ObjectA.10.Event!",     "Device.Test.*.ObjectA.*.Event",
+    "Device.Test.99.ObjectA.10.Event!",     "Device.Test.*.ObjectA.1.Event!",
+    "Device.Test.99.ObjectA.10.Event!",     "Device.Test.*.ObjectA.0.Event!",
+    "Device.Test.99.ObjectA.10.Event!",     "Device.Test.9.ObjectA.10.Event!",
+    "Device.Test.99.ObjectA.10.Event!",     "Device.Test.9.ObjectA.10.Event!",
+    "Device.Test.99.ObjectA.10.Event!",     "Device.Test.99.ObjectA.10.Event!X",
+    "Device.Test.99.ObjectA.10.Event!",     "Device.Test.99.ObjectA.10.Event!1",
+    "Device.Test.99.ObjectA.10.Cmd()",      "Device.Test.*.ObjectA.*.Cmd(",
+    "Device.Test.99.ObjectA.10.Cmd()",      "Device.Test.999.ObjectA.10.Cmd()",
+    "Device.Test.99.ObjectA.10.Cmd()",      "Device.Test.*.ObjectA.11.",
+};
+
+void TestIsPathMatch(void)
+{
+    int i;
+    bool result;
+
+    for (i=0; i < NUM_ELEM(positive_is_path_match_test_cases); i+=2)
+    {
+        result = TEXT_UTILS_IsPathMatch(positive_is_path_match_test_cases[i], positive_is_path_match_test_cases[i+1]);
+        if (result != true)
+        {
+            printf("ERROR: [%d] '%s' should match '%s'\n", i/2, positive_is_path_match_test_cases[i], positive_is_path_match_test_cases[i+1]);
+        }
+    }
+
+    for (i=0; i < NUM_ELEM(negative_is_path_match_test_cases); i+=2)
+    {
+        result = TEXT_UTILS_IsPathMatch(negative_is_path_match_test_cases[i], negative_is_path_match_test_cases[i+1]);
+        if (result != false)
+        {
+            printf("ERROR: [%d] '%s' should not match '%s'\n", i/2, negative_is_path_match_test_cases[i], negative_is_path_match_test_cases[i+1]);
         }
     }
 }

@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019, Broadband Forum
- * Copyright (C) 2016-2019  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -82,15 +82,21 @@
 #define USP_ERR_INVALID_PATH              7026       // Path is not present in the data model schema
 #define USP_ERR_INVALID_COMMAND_ARGS      7027       // Command failed due to invalid arguments
 
+#define USP_ERR_REGISTER_FAILURE          7028       // General failure to register a path
+#define USP_ERR_PATH_ALREADY_REGISTERED   7029       // Failure to register a path because it's already registered
+#define USP_ERR_DEREGISTER_FAILURE        7030       // General failure to deregister a path
+#define USP_ERR_NOT_PATH_OWNER            7031       // Failure to deregister a path because it was owned by another USP Service
+
 // Brokered USP Record Errors
 #define USP_ERR_RECORD_NOT_PARSED         7100       // Record could not be parsed
-#define USP_ERR_SECURE_SESS_REQUIRED      7101       // A secure session must be started before pasing any records
+#define USP_ERR_SECURE_SESS_REQUIRED      7101       // A secure session must be started before passing any records
 #define USP_ERR_SECURE_SESS_NOT_SUPPORTED 7102       // Secure session is not supported by this endpoint
 #define USP_ERR_SEG_NOT_SUPPORTED         7103       // Segmentation and reassembly is not supported by this endpoint
 #define USP_ERR_RECORD_FIELD_INVALID      7104       // A USP record field was invalid
+#define USP_ERR_SESS_CONTEXT_TERMINATED   7105       // Existing Session Context is being terminated
+#define USP_ERR_SESS_CONTEXT_NOT_ALLOWED  7106       // Use of Session Context is not allowed or not supported
 
 // Vendor defined error codes
 // These use codes 7800-7999. Currently USP Agent core does not define any codes in this range.
 
 #endif
-

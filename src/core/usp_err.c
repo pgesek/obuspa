@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2020, Broadband Forum
- * Copyright (C) 2016-2020  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -121,7 +121,7 @@ void USP_ERR_SetMessage(char *fmt, ...)
     // Log the message, if log level permits it
     if (usp_log_level >= kLogLevel_Error)
     {
-        USP_LOG_Puts(kLogType_Debug, buf_to_use);
+        USP_LOG_Puts(kLogLevel_Error, kLogType_Debug, buf_to_use);
     }
 
     // Print the callstack, if debugging is enabled
@@ -328,7 +328,7 @@ char *USP_ERR_UspErrToString(int err)
             break;
 
         case USP_ERR_SECURE_SESS_REQUIRED:
-            s = "Secure seesion required";
+            s = "Secure session required";
             break;
 
         case USP_ERR_SECURE_SESS_NOT_SUPPORTED:
@@ -341,6 +341,14 @@ char *USP_ERR_UspErrToString(int err)
 
         case USP_ERR_RECORD_FIELD_INVALID:
             s = "USP Record field invalid";
+            break;
+
+        case USP_ERR_SESS_CONTEXT_TERMINATED:
+            s = "Session Context terminated";
+            break;
+
+        case USP_ERR_SESS_CONTEXT_NOT_ALLOWED:
+            s = "Session Context not allowed";
             break;
 
         default:
@@ -421,7 +429,7 @@ void USP_ERR_ReplaceEmptyMessage(char *fmt, ...)
 
     if (usp_log_level >= kLogLevel_Error)
     {
-        USP_LOG_Puts(kLogType_Debug, usp_error);
+        USP_LOG_Puts(kLogLevel_Error, kLogType_Debug, usp_error);
     }
 }
 
@@ -464,9 +472,9 @@ void USP_ERR_Terminate(char *fmt, ...)
 
     if (usp_log_level >= kLogLevel_Error)
     {
-        USP_LOG_Puts(kLogType_Debug, usp_error);
+        USP_LOG_Puts(kLogLevel_Error, kLogType_Debug, usp_error);
         USP_LOG_Callstack();
-        USP_LOG_Puts(kLogType_Debug, "Exiting USP Agent");
+        USP_LOG_Puts(kLogLevel_Error, kLogType_Debug, "Exiting USP Agent");
     }
 
     abort();    // call abort() rather than exit() so that a core dump is created
@@ -527,4 +535,3 @@ void SegFaultHandler(int sig)
     USP_LOG_Callstack();
     abort();    // call abort() rather than exit() so that a core dump is created
 }
-

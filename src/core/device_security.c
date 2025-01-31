@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2021, Broadband Forum
- * Copyright (C) 2017-2021  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2017-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -38,7 +38,9 @@
  * Implements the Device.LocalAgent.Certificate and the Device.Security data model object
  *
  */
+#include "vendor_defs.h"
 
+#ifndef REMOVE_DEVICE_SECURITY
 #include <time.h>
 #include <string.h>
 
@@ -138,8 +140,8 @@ typedef struct
     char *subject;              // Free with OPENSSL_free()
     char *issuer;               // Free with OPENSSL_free()
     char *serial_number;        // Free with OPENSSL_free()
-    time_t not_before;
-    time_t not_after;
+    char not_before[MAX_ISO8601_LEN];
+    char not_after[MAX_ISO8601_LEN];
     time_t last_modif;
     char *subject_alt;          // Free with USP_FREE()
     char *signature_algorithm;  // Free with USP_FREE()
@@ -189,9 +191,9 @@ static char *fp_output_args[] =
 
 //------------------------------------------------------------------------------
 // Forward declarations. Note these are not static, because we need them in the symbol table for USP_LOG_Callstack() to show them
-void LoadCerts_FromPath(char *path, cert_usage_t cert_usage, ctrust_role_t role);
-void LoadCerts_FromFile(char *file_path, cert_usage_t cert_usage, ctrust_role_t role);
-void LoadCerts_FromDir(char *dir_path, cert_usage_t cert_usage, ctrust_role_t role);
+void LoadCerts_FromPath(char *path, cert_usage_t cert_usage, int role_instance);
+void LoadCerts_FromFile(char *file_path, cert_usage_t cert_usage, int role_instance);
+void LoadCerts_FromDir(char *dir_path, cert_usage_t cert_usage, int role_instance);
 int Get_NumCerts(dm_req_t *req, char *buf, int len);
 int Get_NumTrustCerts(dm_req_t *req, char *buf, int len);
 int GetCert_LastModif(dm_req_t *req, char *buf, int len);
@@ -214,16 +216,16 @@ int GetClientCert(X509 **p_cert, EVP_PKEY **p_pkey);
 int GetCertFromFile(char *cert_file, X509 **p_cert, EVP_PKEY **p_pkey);
 int GetClientCertFromMemory(X509 **p_cert, EVP_PKEY **p_pkey);
 int AddClientCert(SSL_CTX *ctx);
-int AddCert(X509 *cert, cert_usage_t cert_usage, ctrust_role_t role);
+int AddCert(X509 *cert, cert_usage_t cert_usage, int role_instance);
 void DestroyCert(cert_t *ct);
 X509 *Cert_FromDER(const unsigned char *cert_data, int cert_len);
 int ParseCert_Subject(X509 *cert, char **p_subject);
 int ParseCert_Issuer(X509 *cert, char **p_issuer);
 int ParseCert_LastModif(X509 *cert, time_t *last_modif);
 int ParseCert_SerialNumber(X509 *cert, char **p_serial_number);
-int ParseCert_NotBefore(X509 *cert, time_t *not_before);
-int ParseCert_NotAfter(X509 *cert, time_t *not_after);
-time_t Asn1Time_To_UnixTime(ASN1_TIME *cert_time);
+int ParseCert_NotBefore(X509 *cert, char *buf, int len);
+int ParseCert_NotAfter(X509 *cert, char *buf, int len);
+int Asn1Time_To_ISO8601(ASN1_TIME *cert_time, char *buf, int buflen);
 int ParseCert_SubjectAlt(X509 *cert, char **p_subject_alt);
 int ParseCert_SignatureAlg(X509 *cert, char **p_sig_alg);
 int CalcCertHash(X509 *cert, cert_hash_t *p_hash);
@@ -231,8 +233,6 @@ bool IsSystemTimeReliable(void);
 void LogCertChain(STACK_OF(X509) *cert_chain);
 void LogTrustCerts(void);
 void LogCert_DER(X509 *cert);
-const trust_store_t *GetTrustStoreFromFile(int *num_trusted_certs);
-const trust_store_t *Read_TrustStoreFromFile(int *num_trusted_certs);
 int Operate_GetFingerprint(dm_req_t *req, char *command_key, kv_vector_t *input_args, kv_vector_t *output_args);
 
 /*********************************************************************//**
@@ -254,7 +254,6 @@ int DEVICE_SECURITY_Init(void)
     err |= USP_REGISTER_VendorParam_ReadOnly("Device.Security.CertificateNumberOfEntries", Get_NumCerts, DM_UINT);
     err |= USP_REGISTER_Object(DEVICE_CERT_ROOT ".{i}", USP_HOOK_DenyAddInstance, NULL, NULL,   // This table is read only
                                                         USP_HOOK_DenyDeleteInstance, NULL, NULL);
-    err |= USP_REGISTER_VendorParam_ReadOnly(DEVICE_CERT_ROOT ".{i}.Alias", DM_ACCESS_PopulateAliasParam, DM_STRING);
     err |= USP_REGISTER_VendorParam_ReadOnly(DEVICE_CERT_ROOT ".{i}.LastModif", GetCert_LastModif, DM_DATETIME);
     err |= USP_REGISTER_VendorParam_ReadOnly(DEVICE_CERT_ROOT ".{i}.SerialNumber", GetCert_SerialNumber, DM_STRING);
     err |= USP_REGISTER_VendorParam_ReadOnly(DEVICE_CERT_ROOT ".{i}.Issuer", GetCert_Issuer, DM_STRING);
@@ -267,7 +266,7 @@ int DEVICE_SECURITY_Init(void)
     // Register Device.LocalAgent.Certificate parameters
     err |= USP_REGISTER_Object(DEVICE_LA_CERT_ROOT ".{i}", USP_HOOK_DenyAddInstance, NULL, NULL,   // This table is read only
                                                         USP_HOOK_DenyDeleteInstance, NULL, NULL);
-    err |= USP_REGISTER_VendorParam_ReadOnly("Device.LocalAgent.CertificateNumberOfEntries", Get_NumTrustCerts, DM_STRING);
+    err |= USP_REGISTER_VendorParam_ReadOnly("Device.LocalAgent.CertificateNumberOfEntries", Get_NumTrustCerts, DM_UINT);
 
     err |= USP_REGISTER_VendorParam_ReadOnly(DEVICE_LA_CERT_ROOT ".{i}.Alias", DM_ACCESS_PopulateAliasParam, DM_STRING);
     err |= USP_REGISTER_VendorParam_ReadOnly(DEVICE_LA_CERT_ROOT ".{i}.SerialNumber", GetLaCert_SerialNumber, DM_STRING);
@@ -277,28 +276,20 @@ int DEVICE_SECURITY_Init(void)
     err |= USP_REGISTER_SyncOperation(DEVICE_LA_CERT_ROOT ".{i}.GetFingerprint()", Operate_GetFingerprint);
     err |= USP_REGISTER_OperationArguments(DEVICE_LA_CERT_ROOT ".{i}.GetFingerprint()", fp_input_args, NUM_ELEM(fp_input_args),
                                                                                         fp_output_args, NUM_ELEM(fp_output_args));
-    err |= USP_REGISTER_Param_Constant("Device.LocalAgent.SupportedFingerprintAlgorithms", "SHA-1,SHA-224,SHA-256,SHA-384,SHA-512", DM_STRING);
+    err |= USP_REGISTER_Param_SupportedList("Device.LocalAgent.SupportedFingerprintAlgorithms", fp_algs, NUM_ELEM(fp_algs));
 
     // Register unique keys for tables
     char *unique_keys[] = { "SerialNumber", "Issuer" };
+    char *alias_unique_key[] = { "Alias" };
     err |= USP_REGISTER_Object_UniqueKey(DEVICE_CERT_ROOT ".{i}", unique_keys, NUM_ELEM(unique_keys));
     err |= USP_REGISTER_Object_UniqueKey(DEVICE_LA_CERT_ROOT ".{i}", unique_keys, NUM_ELEM(unique_keys));
+    err |= USP_REGISTER_Object_UniqueKey(DEVICE_LA_CERT_ROOT ".{i}", alias_unique_key, NUM_ELEM(alias_unique_key));
 
     // Exit if any errors occurred
     if (err != USP_ERR_OK)
     {
         return USP_ERR_INTERNAL_ERROR;
     }
-
-    // Exit if any errors occurred
-    if (err != USP_ERR_OK)
-    {
-        return USP_ERR_INTERNAL_ERROR;
-    }
-
-    // Initialise SSL
-    SSL_library_init();                 // Initialises lib SSL
-    SSL_load_error_strings();
 
     // Initialise client certificate structure
     memset(&client_cert, 0, sizeof(client_cert));
@@ -313,7 +304,9 @@ int DEVICE_SECURITY_Init(void)
 **
 ** DEVICE_SECURITY_Start
 **
-** Starts this component, adding all instances to the data model
+** Loads all trust store and client certificates into memory
+** NOTE: This function must not create any permanent SSL contests, as
+**       libwebsockets re-initialises LibSSL, after this function is called
 **
 ** \param   None
 **
@@ -334,14 +327,19 @@ int DEVICE_SECURITY_Start(void)
     }
 
     // Add trust store certificates specified by '-t' option
-    if (usp_trust_store_file != NULL)
+    // NOTE: The string compare test is present in order to allow an invocation of USP Agent to specify no trust store file using -t "null". Useful, if the -t option is always used in all invocations.
+    if ((usp_trust_store_file != NULL) && (strcmp(usp_trust_store_file, "null") != 0))
     {
-        LoadCerts_FromPath(usp_trust_store_file, kCertUsage_TrustCert, kCTrustRole_FullAccess);
+        LoadCerts_FromPath(usp_trust_store_file, kCertUsage_TrustCert, ROLE_TRUST_STORE_DEFAULT);
     }
 
     // Exit if unable to create a temporary SSL context.
     // This is necessary because the load_agent_cert vendor hook only loads into an SSL context
+#if OPENSSL_VERSION_NUMBER >= 0x1010000FL  // SSL version 1.1.0
+    temp_ssl_ctx = SSL_CTX_new(TLS_client_method());
+#else
     temp_ssl_ctx = SSL_CTX_new(SSLv23_client_method());
+#endif
     if (temp_ssl_ctx == NULL)
     {
         USP_ERR_SetMessage("%s: SSL_CTX_new failed", __FUNCTION__);
@@ -388,7 +386,7 @@ exit:
     }
 
     // Load the certificates contained in the system cert directory
-    LoadCerts_FromPath(SYSTEM_CERT_PATH, kCertUsage_SystemCert, INVALID_ROLE);
+    LoadCerts_FromPath(SYSTEM_CERT_PATH, kCertUsage_SystemCert, INVALID);
 
     return err;
 }
@@ -442,22 +440,20 @@ void DEVICE_SECURITY_Stop(void)
 **
 ** DEVICE_SECURITY_GetControllerTrust
 **
-** Obtains the controller trust level to use for controllers attached to this connection
+** Obtains the controller trust role to use for controllers attached to this connection
 ** NOTE: This function is called from the MTP thread, so it should only log errors (not call USP_ERR_SetMessage)
 ** NOTE: The DM thread owned variables accessed by this function are seeded at startup and are immutable afterwards,
 **       therefore this function may safely be called from the MTP thread even though it accesses variables
 **       which are owned by the DM thread
 **
 ** \param   cert_chain - pointer to verified certificate chain for this connection
-** \param   role - pointer to variable in which to return role permitted by CA cert
-** \param   allowed_controllers - pointer to variable in which to return a pointer to a dynamically allocated string
-**                     containing the URN of permitted controller endpoint_ids ('from_id's)
+** \param   role_instance - pointer to variable in which to return instance in Device.LocalAgent.ControllerTrust.Role.{i} permitted by CA cert
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
 #define STACK_OF_X509  STACK_OF(X509)  // Define so that ctags works for this function
-int DEVICE_SECURITY_GetControllerTrust(STACK_OF_X509 *cert_chain, ctrust_role_t *role, char **allowed_controllers)
+int DEVICE_SECURITY_GetControllerTrust(STACK_OF_X509 *cert_chain, int *role_instance)
 {
     int err;
     unsigned num_certs;
@@ -483,14 +479,6 @@ int DEVICE_SECURITY_GetControllerTrust(STACK_OF_X509 *cert_chain, ctrust_role_t 
     if (broker_cert == NULL)
     {
         USP_LOG_Error("%s: Unable to get broker cert with sk_X509_value()", __FUNCTION__);
-        return USP_ERR_INTERNAL_ERROR;
-    }
-
-    // Exit if unable to extract the names of the controllers allowed by the broker cert
-    err = ParseCert_SubjectAlt(broker_cert, allowed_controllers);
-    if (err != USP_ERR_OK)
-    {
-        USP_LOG_Error("%s: Unable to obtain the SubjectAltName of a valid controller from the broker certificate", __FUNCTION__);
         return USP_ERR_INTERNAL_ERROR;
     }
 
@@ -521,8 +509,8 @@ int DEVICE_SECURITY_GetControllerTrust(STACK_OF_X509 *cert_chain, ctrust_role_t 
     }
 
     // Exit if unable to get a role associated with the certificate
-    *role = DEVICE_CTRUST_GetCertRole(ct->la_instance);
-    if (*role == INVALID_ROLE)
+    *role_instance = DEVICE_CTRUST_GetCertInheritedRole(ct->la_instance);
+    if (*role_instance == INVALID)
     {
         USP_LOG_Error("%s: CA cert in chain of trust (Device.LocalAgent.Certificate.%d) did not have an associated role in Device.LocalAgent.ControllerTrust.Credential.{i}", __FUNCTION__, ct->la_instance);
         LogCertChain(cert_chain);
@@ -560,11 +548,6 @@ SSL_CTX *DEVICE_SECURITY_CreateSSLContext(const SSL_METHOD *method, int verify_m
         goto exit;
     }
 
-    // Explicitly disallow SSLv2, as it is insecure. See https://arxiv.org/pdf/1407.2168.pdf
-    // NOTE: Even without this, SSLv2 ciphers don't seem to appear in the cipher list. Just added in case someone is using an older version of OpenSSL.
-    SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_SSLv2);
-    // SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION);
-
     // Exit if unable to load our trust store and client cert into the SSL context's trust store
     err = DEVICE_SECURITY_LoadTrustStore(ssl_ctx, verify_mode, verify_callback);
     if (err != USP_ERR_OK)
@@ -586,7 +569,7 @@ exit:
 **
 ** \param   ssl_ctx - pointer to SSL context to add trust store certs to
 ** \param   verify_mode - whether SSL should verify the peer (SSL_VERIFY_PEER), and whether to only perform verification once (SSL_VERIFY_CLIENT_ONCE - for DTLS servers)
-** \param   verify_callback - Function to call when verifying certificates from the server
+** \param   verify_callback - Function to call when verifying certificates from the server or NULL if none should be set
 **
 ** \return  USP_ERR_OK if successful
 **
@@ -625,7 +608,10 @@ int DEVICE_SECURITY_LoadTrustStore(SSL_CTX *ssl_ctx, int verify_mode, ssl_verify
     }
 
     // Set the verify callback to use for each certificate
-    SSL_CTX_set_verify(ssl_ctx, verify_mode, verify_callback);
+    if ((verify_callback != NULL) && (verify_mode != 0))
+    {
+        SSL_CTX_set_verify(ssl_ctx, verify_mode, verify_callback);
+    }
 
     // Load the client cert using the load_agent_cert vendor hook (if registered)
     load_agent_cert_cb = vendor_hook_callbacks.load_agent_cert_cb;
@@ -701,7 +687,8 @@ void DEVICE_SECURITY_GetClientCertStatus(bool *available, bool *matches_endpoint
 **
 ** \param   preverify_ok - set to 1, if the current certificate passed, set to 0 if it did not
 ** \param   x509_ctx - pointer to context for certificate chain verification
-** \param   p_cert_chain - double pointer to a STACK_OF_X509 cert chain
+** \param   p_cert_chain - pointer to variable in which to return a pointer to a saved cert chain
+**                         NOTE: If a cert chain is already saved, then the cert chain is not updated
 **
 ** \return  1 if certificate chain should be trusted
 **          0 if certificate chain should not be trusted, and connection dropped
@@ -801,7 +788,7 @@ int DEVICE_SECURITY_TrustCertVerifyCallback(int preverify_ok, X509_STORE_CTX *x5
     ssl = X509_STORE_CTX_get_ex_data(x509_ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
     USP_ASSERT(ssl != NULL);
 
-    // Get the pointer to variable in which to save the certificate chain)
+    // Get the pointer to variable in which to save the certificate chain
     p_cert_chain = (STACK_OF(X509) **)SSL_get_app_data(ssl);
 
     // Simplification, allow this to be functionally the same with origin of p_cert_chain to differ
@@ -810,12 +797,12 @@ int DEVICE_SECURITY_TrustCertVerifyCallback(int preverify_ok, X509_STORE_CTX *x5
 
 /*********************************************************************//**
 **
-** DEVICE_SECURITY_BulkDataTrustCertVerifyCallback
+** DEVICE_SECURITY_NoSaveTrustCertVerifyCallback
 **
 ** Called back from OpenSSL for each certificate in the received server certificate chain of trust
 ** This function is used to ignore certificate validation errors caused by system time being incorrect
-** NOTE: This code is different from TrustStoreVerifyCallback() in that it does not save the certificate
-**       chain for use by ControllerTrust
+** NOTE: This code is different from DEVICE_SECURITY_TrustCertVerifyCallback() in that it does not
+**       save the certificate chain for use by ControllerTrust
 **
 ** \param   preverify_ok - set to 1, if the current certificate passed, set to 0 if it did not
 ** \param   x509_ctx - pointer to context for certificate chain verification
@@ -824,7 +811,7 @@ int DEVICE_SECURITY_TrustCertVerifyCallback(int preverify_ok, X509_STORE_CTX *x5
 **          0 if certificate chain should not be trusted, and connection dropped
 **
 **************************************************************************/
-int DEVICE_SECURITY_BulkDataTrustCertVerifyCallback(int preverify_ok, X509_STORE_CTX *x509_ctx)
+int DEVICE_SECURITY_NoSaveTrustCertVerifyCallback(int preverify_ok, X509_STORE_CTX *x509_ctx)
 {
     int cert_err;
     bool is_reliable;
@@ -932,6 +919,10 @@ int DEVICE_SECURITY_AddCertHostnameValidation(SSL* ssl, const char* name, size_t
 }
 #endif
 
+#if OPENSSL_VERSION_NUMBER >= 0x0090806f // SSL version 0.9.8f
+    SSL_set_tlsext_host_name(ssl, name);
+#endif
+
     return USP_ERR_OK;
 }
 
@@ -982,18 +973,132 @@ int DEVICE_SECURITY_AddCertHostnameValidationCtx(SSL_CTX* ssl_ctx, const char* n
 
 /*********************************************************************//**
 **
+** DEVICE_SECURITY_ValidateALPN
+**
+** Determines whether the specified ALPN options are valid
+**
+** \param   req - pointer to structure identifying the parameter (unused)
+** \param   value - value that the controller would like to set the parameter to
+**
+** \return  USP_ERR_OK if options are valid
+**
+**************************************************************************/
+int DEVICE_SECURITY_ValidateALPN(dm_req_t *req, char *value)
+{
+    int len;
+    str_vector_t sv;
+    char *option;
+    int i;
+    int err = USP_ERR_OK;
+
+    (void)req;      // Keep compiler happy about unused argument
+
+    // Exit if no ALPN options to validate
+    if (*value == '\0')
+    {
+        return USP_ERR_OK;
+    }
+
+    // Form a vector of each of the options to set
+    TEXT_UTILS_SplitString(value, &sv, ",");
+
+    for (i=0; i < sv.num_entries; i++)
+    {
+        option = sv.vector[i];
+        len = strlen(option);
+        USP_ASSERT(len != 0);       // TEXT_UTILS_SplitString() should not have populated the string vector with zero length strings
+        if (len > 255)
+        {
+            option[20] = '\0';      // Truncate the option, in order to log it
+            USP_ERR_SetMessage("%s: ALPN option too long ('%s...')", __FUNCTION__, option);
+            err = USP_ERR_INVALID_ARGUMENTS;
+            goto exit;
+        }
+    }
+
+exit:
+    STR_VECTOR_Destroy(&sv);
+    return err;
+}
+
+/*********************************************************************//**
+**
+** DEVICE_SECURITY_SetALPN
+**
+** Sets the Application Layer Protocol Negotiation options to put in all subsequent SSL ClientHello messages
+**
+** \param   ssl_ctx - pointer to SSL context to set the ALPN options up in
+** \param   alpn - string containing comma separated list of ALPN options
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int DEVICE_SECURITY_SetALPN(SSL_CTX *ssl_ctx, char *alpn)
+{
+    int len;
+    str_vector_t sv;
+    char *option;
+    unsigned char *buf;
+    unsigned char *p;
+    int err;
+    int i;
+
+    // Exit if no ALPN options to set
+    if ((alpn == NULL) || (*alpn == '\0'))
+    {
+        // Turn off any ALPN options set previously.
+        SSL_CTX_set_alpn_protos(ssl_ctx, NULL, 0);   // NOTE: This call returns an error, but does work in clearing any previously set ALPN options
+        return USP_ERR_OK;
+    }
+
+    // Form a vector of each of the options to set
+    TEXT_UTILS_SplitString(alpn, &sv, ",");
+
+    // Allocate a buffer to place the ALPN options in the format required by OpenSSL library
+    // The buffer contains one length byte followed by the option, for each option
+    len = strlen(alpn) + 1;     // Plus 1 to include a length byte for the first option. The length byte of subsequent options are covered by the comma character
+    buf = USP_MALLOC(len);
+
+    p = buf;
+    for (i=0; i < sv.num_entries; i++)
+    {
+        option = sv.vector[i];
+        len = strlen(option);
+        USP_ASSERT((len > 0) && (len <= 255));
+
+        WRITE_BYTE(p, len);
+        WRITE_N_BYTES(p, option, len);
+    }
+
+    len = p - buf;
+    err = SSL_CTX_set_alpn_protos(ssl_ctx, (const unsigned char *) buf, len);
+    if (err != 0)
+    {
+        USP_LOG_Error("%s: Failed to set ALPN in the SSL CTX", __FUNCTION__);
+        return USP_ERR_INTERNAL_ERROR;
+    }
+
+    // Clean up
+    USP_FREE(buf);
+    STR_VECTOR_Destroy(&sv);
+
+    return USP_ERR_OK;
+}
+
+/*********************************************************************//**
+**
 ** LoadCerts_FromPath
 **
 ** Called to load all certificates in the specified file or directory into the Device.Security.Certificate table
 **
 ** \param   path - file or directory containing system certs
 ** \param   cert_usage - type of certificates to add
-** \param   role - if the certificates are trust certs, then this is the role that the certs permit to a broker cert
+** \param   role_instance - if the certificates are trust certs, then this is the role that the certs permit to a broker cert
 **
 ** \return  None - errors are ignored
 **
 **************************************************************************/
-void LoadCerts_FromPath(char *path, cert_usage_t cert_usage, ctrust_role_t role)
+void LoadCerts_FromPath(char *path, cert_usage_t cert_usage, int role_instance)
 {
     int err;
     struct stat info;
@@ -1019,11 +1124,11 @@ void LoadCerts_FromPath(char *path, cert_usage_t cert_usage, ctrust_role_t role)
     type = info.st_mode & S_IFMT;
     if ((type == S_IFREG) || (type == S_IFLNK))
     {
-        LoadCerts_FromFile(path, cert_usage, role);
+        LoadCerts_FromFile(path, cert_usage, role_instance);
     }
     else if (type == S_IFDIR)
     {
-        LoadCerts_FromDir(path, cert_usage, role);
+        LoadCerts_FromDir(path, cert_usage, role_instance);
     }
     else
     {
@@ -1035,16 +1140,16 @@ void LoadCerts_FromPath(char *path, cert_usage_t cert_usage, ctrust_role_t role)
 **
 ** LoadCerts_FromFile
 **
-** Called to load all certificates contained in the specified directory (in PEM format) into the Device.Security.Certificate table
+** Called to load all certificates contained in the specified file (in PEM format) into the Device.Security.Certificate table
 **
 ** \param   file_path - file containing certs
 ** \param   cert_usage - type of certificates to add
-** \param   role - if the certificates are trust certs, then this is the role that the certs permit to a broker cert
+** \param   role_instance - if the certificates are trust certs, then this is the role that the certs permit to a broker cert
 **
 ** \return  None - errors are ignored
 **
 **************************************************************************/
-void LoadCerts_FromFile(char *file_path, cert_usage_t cert_usage, ctrust_role_t role)
+void LoadCerts_FromFile(char *file_path, cert_usage_t cert_usage, int role_instance)
 {
     FILE *fp;
     X509 *cert;
@@ -1064,7 +1169,7 @@ void LoadCerts_FromFile(char *file_path, cert_usage_t cert_usage, ctrust_role_t 
     {
         // Skip this file if unable to add the certificate
         // NOTE: Ownership of the X509 cert passes to AddCert(), so no need to free it in this function
-        err = AddCert(cert, cert_usage, role);
+        err = AddCert(cert, cert_usage, role_instance);
         if (err != USP_ERR_OK)
         {
             continue;
@@ -1086,12 +1191,12 @@ void LoadCerts_FromFile(char *file_path, cert_usage_t cert_usage, ctrust_role_t 
 **
 ** \param   dir_path - directory containing certs
 ** \param   cert_usage - type of certificates to add
-** \param   role - if the certificates are trust certs, then this is the role that the certs permit to a broker cert
+** \param   role_instance - if the certificates are trust certs, then this is the role that the certs permit to a broker cert
 **
 ** \return  None - errors are ignored
 **
 **************************************************************************/
-void LoadCerts_FromDir(char *dir_path, cert_usage_t cert_usage, ctrust_role_t role)
+void LoadCerts_FromDir(char *dir_path, cert_usage_t cert_usage, int role_instance)
 {
     DIR *dir;
     struct dirent *entry;
@@ -1152,7 +1257,7 @@ void LoadCerts_FromDir(char *dir_path, cert_usage_t cert_usage, ctrust_role_t ro
 
         // Skip this file if unable to add the certificate
         // NOTE: Ownership of the X509 cert passes to AddCert(), so no need to free it in this function
-        err = AddCert(cert, cert_usage, role);
+        err = AddCert(cert, cert_usage, role_instance);
         if (err != USP_ERR_OK)
         {
             continue;
@@ -1441,8 +1546,8 @@ void LogCertChain(STACK_OF_X509 *cert_chain)
     int i;
     X509 *cert;
     unsigned num_certs;
-    char *subject;
-    char *issuer;
+    char subject[257];
+    char issuer[257];
 
     // Iterate over all certs in the chain, printing their subject and issuer
     num_certs = sk_X509_num(cert_chain);
@@ -1452,12 +1557,14 @@ void LogCertChain(STACK_OF_X509 *cert_chain)
         cert = (X509*) sk_X509_value(cert_chain, i);
         if (cert == NULL)
         {
-            subject = issuer = "Unable to get cert";
+            char *fail_str = "Unable to get cert";
+            USP_STRNCPY(subject, fail_str, sizeof(subject));
+            USP_STRNCPY(issuer, fail_str, sizeof(issuer));
         }
         else
         {
-            subject = X509_NAME_oneline(X509_get_subject_name(cert), NULL, 0);
-            issuer = X509_NAME_oneline(X509_get_issuer_name(cert), NULL, 0);
+            X509_NAME_oneline(X509_get_subject_name(cert), subject, sizeof(subject));
+            X509_NAME_oneline(X509_get_issuer_name(cert), issuer, sizeof(issuer));
         }
         USP_LOG_Info("[%d] Subject: %s", i, subject);
         USP_LOG_Info("[%d]      (Issuer: %s)", i, issuer);
@@ -1555,7 +1662,7 @@ int AddClientCert(SSL_CTX *ctx)
 
     // Exit if unable to add the client certificate into Device.Security.Certificate
     // NOTE: Ownership of the X509 cert stays with SSL ctx and agent_cert pointer
-    err = AddCert(cert, kCertUsage_ClientCert, INVALID_ROLE);
+    err = AddCert(cert, kCertUsage_ClientCert, INVALID);
     if (err != USP_ERR_OK)
     {
         USP_SAFE_FREE(subject_alt);
@@ -1693,7 +1800,7 @@ int GetCert_NotBefore(dm_req_t *req, char *buf, int len)
     // Write the value into the return buffer
     ct = Find_SecurityCertByReq(req);
     USP_ASSERT(ct != NULL);
-    val_datetime = ct->not_before;
+    USP_STRNCPY(buf, ct->not_before, len);
     return USP_ERR_OK;
 }
 
@@ -1717,7 +1824,7 @@ int GetCert_NotAfter(dm_req_t *req, char *buf, int len)
     // Write the value into the return buffer
     ct = Find_SecurityCertByReq(req);
     USP_ASSERT(ct != NULL);
-    val_datetime = ct->not_after;
+    USP_STRNCPY(buf, ct->not_after, len);
     return USP_ERR_OK;
 }
 
@@ -2015,12 +2122,13 @@ cert_t *Find_CertByHash(cert_hash_t hash)
 **                 NOTE: If the certificate is a client cert, then ownership of the cert stays with the caller
 **                 NOTE: If the certificate is a system cert, then it will be freed by this function
 ** \param   cert_usage - type of certificate to add
-** \param   role - if the certificate is a trust cert, then this is the role that this cert permits to a broker cert
+** \param   role_instance - if the certificate is a trust cert, then this is the role that this cert permits to a broker cert,
+**                          if the certificate is a trust cert, then this is set to INVALID
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int AddCert(X509 *cert, cert_usage_t cert_usage, ctrust_role_t role)
+int AddCert(X509 *cert, cert_usage_t cert_usage, int role_instance)
 {
     int new_num_entries;
     cert_hash_t hash;
@@ -2032,6 +2140,7 @@ int AddCert(X509 *cert, cert_usage_t cert_usage, ctrust_role_t role)
     err = CalcCertHash(cert, &hash);
     if (err != USP_ERR_OK)
     {
+        X509_free(cert);
         return err;
     }
 
@@ -2058,11 +2167,11 @@ int AddCert(X509 *cert, cert_usage_t cert_usage, ctrust_role_t role)
     err |= ParseCert_Issuer(cert, &ct->issuer);
     err |= ParseCert_LastModif(cert, &ct->last_modif);
     err |= ParseCert_SerialNumber(cert, &ct->serial_number);
-    err |= ParseCert_NotBefore(cert, &ct->not_before);
-    err |= ParseCert_NotAfter(cert, &ct->not_after);
+    err |= ParseCert_NotBefore(cert, ct->not_before, sizeof(ct->not_before));
+    err |= ParseCert_NotAfter(cert, ct->not_after, sizeof(ct->not_after));
     err |= ParseCert_SubjectAlt(cert, &ct->subject_alt);
     err |= ParseCert_SignatureAlg(cert, &ct->signature_algorithm);
-    err |= CalcCertHash(cert, &ct->hash);
+    ct->hash = hash;
 
     // Exit if any error occurred when parsing
     if (err != USP_ERR_OK)
@@ -2123,7 +2232,7 @@ int AddCert(X509 *cert, cert_usage_t cert_usage, ctrust_role_t role)
         }
 
         // Exit if unable to add the certificate to the Device.LocalAgent.ControllerTrust.Credential table
-        err = DEVICE_CTRUST_AddCertRole(ct->la_instance, role);
+        err = DEVICE_CTRUST_AddCertRole(ct->la_instance, role_instance, false);
         if (err != USP_ERR_OK)
         {
             return err;
@@ -2328,26 +2437,29 @@ int ParseCert_SerialNumber(X509 *cert, char **p_serial_number)
 ** Extracts the NotBefore time field of the specified cert
 **
 ** \param   cert - pointer to the certificate structure to extract the details of
-** \param   not_before - pointer to variable in which to return the value of the extracted field
+** \param   buf - pointer to buffer in which to return ISO8601 format string
+** \param   len - length of buffer in which to return ISO8601 format string
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ParseCert_NotBefore(X509 *cert, time_t *not_before)
+int ParseCert_NotBefore(X509 *cert, char *buf, int len)
 {
     ASN1_TIME *cert_time;
 
     // Exit if unable to get a not before time
+#if OPENSSL_VERSION_NUMBER >= 0x1010000FL  // SSL version 1.1.0
+    cert_time = X509_getm_notBefore(cert);
+#else
     cert_time = X509_get_notBefore(cert);
+#endif
     if (cert_time == NULL)
     {
         USP_ERR_SetMessage("%s: X509_get_notBefore() failed", __FUNCTION__);
         return USP_ERR_INTERNAL_ERROR;
     }
 
-    *not_before = Asn1Time_To_UnixTime(cert_time);
-
-    return USP_ERR_OK;
+    return Asn1Time_To_ISO8601(cert_time, buf, len);
 }
 
 /*********************************************************************//**
@@ -2357,62 +2469,65 @@ int ParseCert_NotBefore(X509 *cert, time_t *not_before)
 ** Extracts the NotBefore time field of the specified cert
 **
 ** \param   cert - pointer to the certificate structure to extract the details of
-** \param   not_after - pointer to variable in which to return the value of the extracted field
+** \param   buf - pointer to buffer in which to return ISO8601 format string
+** \param   len - length of buffer in which to return ISO8601 format string
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ParseCert_NotAfter(X509 *cert, time_t *not_after)
+int ParseCert_NotAfter(X509 *cert, char *buf, int len)
 {
     ASN1_TIME *cert_time;
 
     // Exit if unable to get a not after time
+#if OPENSSL_VERSION_NUMBER >= 0x1010000FL  // SSL version 1.1.0
+    cert_time = X509_getm_notAfter(cert);
+#else
     cert_time = X509_get_notAfter(cert);
+#endif
     if (cert_time == NULL)
     {
         USP_ERR_SetMessage("%s: X509_get_notAfter() failed", __FUNCTION__);
         return USP_ERR_INTERNAL_ERROR;
     }
 
-    *not_after = Asn1Time_To_UnixTime(cert_time);
-
-    return USP_ERR_OK;
+    return Asn1Time_To_ISO8601(cert_time, buf, len);
 }
 
 /*********************************************************************//**
 **
-** Asn1Time_To_UnixTime
+** Asn1Time_To_ISO8601
 **
-** Converts a time specified in SSL ASN1 to a unix time
+** Converts a time specified in SSL ASN1 to am ISO8601 time
 **
 ** \param   cert_time - pointer to SSL ANS1 time to convert
+** \param   buf - pointer to buffer in which to return ISO8601 format string
+** \param   buflen - length of buffer in which to return ISO8601 format string
 **
-** \return  converted time or INVALID_TIME if failed to convert
+** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-time_t Asn1Time_To_UnixTime(ASN1_TIME *cert_time)
+int Asn1Time_To_ISO8601(ASN1_TIME *cert_time, char *buf, int buflen)
 {
     char *s;
     struct tm tm;
-    time_t t;
     int i;
     int len;
 
+    // Exit if the string does not match one of the lengths we are expecting
     s = (char *) cert_time->data;
     len = strlen(s);
-
-    // Exit if the string does not match one of the lengths we are expecting
     if ((len != 13) && (len != 15))
     {
         USP_ERR_SetMessage("%s: ASN1 string ('%s') does not match expected format (wrong length)", __FUNCTION__, s);
-        return INVALID_TIME;
+        return USP_ERR_INTERNAL_ERROR;
     }
 
     // Exit if the string is not terminated by 'Z'
     if (s[len-1] != 'Z')
     {
         USP_ERR_SetMessage("%s: ASN1 string ('%s') does not match expected format (not terminated in 'Z')", __FUNCTION__, s);
-        return INVALID_TIME;
+        return USP_ERR_INTERNAL_ERROR;
     }
 
     // Exit if one of the digits is not numeric
@@ -2421,7 +2536,7 @@ time_t Asn1Time_To_UnixTime(ASN1_TIME *cert_time)
         if ((s[i] < '0') || (s[i] > '9'))
         {
             USP_ERR_SetMessage("%s: ASN1 string ('%s') contains invalid digit ('%c')", __FUNCTION__, s, s[i]);
-            return INVALID_TIME;
+            return USP_ERR_INTERNAL_ERROR;
         }
     }
 
@@ -2445,7 +2560,7 @@ time_t Asn1Time_To_UnixTime(ASN1_TIME *cert_time)
         if (tm.tm_year < 70)
         {
             USP_ERR_SetMessage("%s: ASN1 string ('%s') contains invalid year", __FUNCTION__, s);
-            return INVALID_TIME;
+            return USP_ERR_INTERNAL_ERROR;
         }
 
         s += 4; // Skip to month characters
@@ -2454,19 +2569,20 @@ time_t Asn1Time_To_UnixTime(ASN1_TIME *cert_time)
     // Fill in other fields
     tm.tm_mon  = 10*TO_DIGIT(s[0]) + TO_DIGIT(s[1]) - 1; // Month 0-11
     tm.tm_mday = 10*TO_DIGIT(s[2]) + TO_DIGIT(s[3]);     // Day of month 1-31
-    tm.tm_hour = 10*TO_DIGIT(s[4]) + TO_DIGIT(s[5]); ;   // Hour 0-23
+    tm.tm_hour = 10*TO_DIGIT(s[4]) + TO_DIGIT(s[5]);     // Hour 0-23
     tm.tm_min  = 10*TO_DIGIT(s[6]) + TO_DIGIT(s[7]);     // Minute 0-59
-    tm.tm_sec  = 10*TO_DIGIT(s[8]) + TO_DIGIT(s[9]);   // Second 0-59
+    tm.tm_sec  = 10*TO_DIGIT(s[8]) + TO_DIGIT(s[9]);     // Second 0-59
 
-    // Exit if unable to convert the time
-    t = mktime(&tm);
-    if (t == INVALID_TIME)
+    // Exit if  unable to Form the ISO8601 string in the return buffer
+    buf[0] = '\0';
+    len = iso8601_strftime(buf, buflen, &tm);
+    if (len == 0)
     {
-        USP_ERR_SetMessage("%s: timegm() failed for ASN1 string ('%s')", __FUNCTION__, s);
-        return INVALID_TIME;
+        USP_ERR_SetMessage("%s: iso8601_strftime() failed", __FUNCTION__);
+        return USP_ERR_INTERNAL_ERROR;
     }
 
-    return t;
+    return USP_ERR_OK;
 }
 
 /*********************************************************************//**
@@ -2797,7 +2913,7 @@ int CalcCertHash(X509 *cert, cert_hash_t *p_hash)
 **
 ** LoadTrustStore
 **
-** Called to load the trusted root certificate store
+** Called to load the trusted root certs provided by the get_trust_store vendor hook
 **
 ** \param   None
 **
@@ -2814,7 +2930,7 @@ int LoadTrustStore(void)
     get_trust_store_cb_t get_trust_store_cb;
     X509 *cert;
 
-    // Determine vendor hook function to call to get the trust store from in-memmory array
+    // Determine vendor hook function to call to get the trust store from in-memory array
     if (vendor_hook_callbacks.get_trust_store_cb != NULL)
     {
         get_trust_store_cb = vendor_hook_callbacks.get_trust_store_cb;
@@ -2840,7 +2956,7 @@ int LoadTrustStore(void)
         if (cert != NULL)
         {
             // NOTE: Ownership of the X509 cert passes to AddCert(), so no need to free it in this function
-            err = AddCert(cert, kCertUsage_TrustCert, tct->role);
+            err = AddCert(cert, kCertUsage_TrustCert, tct->role_instance);
             if (err != USP_ERR_OK)
             {
                 return err;
@@ -3003,4 +3119,6 @@ int Operate_GetFingerprint(dm_req_t *req, char *command_key, kv_vector_t *input_
 
     return USP_ERR_OK;
 }
+
+#endif // REMOVE_DEVICE_SECURITY
 

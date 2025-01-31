@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019, Broadband Forum
- * Copyright (C) 2008-2019  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2008-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -174,7 +174,7 @@ iso8601_us_strftime(char *buf, size_t bufsiz, const struct timeval *tv)
 
         size_t sz;
         sz = strftime(buf, bufsiz-8, "%FT%T.", gmtime(&tv->tv_sec));
-        sz += sprintf(buf+strlen(buf), "%06ldZ", tv->tv_usec);
+        sz += sprintf(buf+strlen(buf), "%06ldZ", (long int)tv->tv_usec);
         return sz;
 }
 

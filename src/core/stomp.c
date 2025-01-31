@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2021, Broadband Forum
- * Copyright (C) 2016-2021  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -84,7 +84,6 @@
 #define EMPTY_BODY ""
 
 #define BBF_STOMP_CONTENT_TYPE        "application/vnd.bbf.usp.msg"
-#define BBF_STOMP_ERROR_CONTENT_TYPE  "application/vnd.bbf.usp.error"
 
 //------------------------------------------------------------------------------
 // State of a STOMP connection
@@ -166,8 +165,7 @@ typedef struct
     SSL *ssl;               // SSL used for this STOMP connection
     STACK_OF(X509) *cert_chain; // Full SSL certificate chain for the STOMP connection, collected in the SSL verify callback
 
-    char *allowed_controllers; // pattern describing the endpoint_id of controllers which is granted access to this agent
-    ctrust_role_t role;     // role granted by the CA cert in the chain of trust with the STOMP broker
+    int role_instance;     // role granted by the CA cert in the chain of trust with the STOMP broker (instance in Device.LocalAgent.ControllerTrust.Role.{i})
 
     char *subscribe_dest;   // STOMP destination to subscribe to (received from the STOMP server in the CONNECTED frame).
                             // This overrides Device.LocalAgent.MTP.{i}.STOMP.Destination.
@@ -206,18 +204,14 @@ typedef struct
 static stomp_connection_t stomp_connections[MAX_STOMP_CONNECTIONS];
 
 //------------------------------------------------------------------------------
-// USP Message to send in queue
+// Payload to send in STOMP queue
 typedef struct
 {
     double_link_t link;     // Doubly linked list pointers. These must always be first in this structure
-    Usp__Header__MsgType usp_msg_type;  // Type of USP message contained within pbuf (if content_type==kStompContentType_UspRecord)
-    unsigned char *pbuf;    // content of STOMP frame to send
-    int pbuf_len;           // Length of content to send
-    mtp_content_type_t content_type; // Type of content stored in pbuf
+    mtp_send_item_t item;   // Information about the content to send
     char *controller_queue; // Name of the STOMP queue to send this message to
     char *agent_queue;      // Name of the STOMP queue used by this agent
-    char *err_id_header;    // Value of 'usp-err-id' STOMP header to put in the STOMP frame
-    time_t expiry_time;     // Time at which this message should be removed from the queue
+    time_t expiry_time;     // Time at which this USP record should be removed from the queue
 } stomp_send_item_t;
 
 //------------------------------------------------------------------------------
@@ -260,8 +254,9 @@ void HandleStompSocketError(stomp_connection_t *sc, stomp_failure_t failure_code
 unsigned CalculateStompRetryWaitTime(unsigned retry_count, double interval, double multiplier);
 int StartSendingFrame_STOMP(stomp_connection_t *sc);
 int StartSendingFrame_SUBSCRIBE(stomp_connection_t *sc);
-int StartSendingFrame_SEND(stomp_connection_t *sc, char *controller_queue, char *agent_queue, Usp__Header__MsgType usp_msg_type, unsigned char *pbuf, int pbuf_len, mtp_content_type_t content_type, char *err_id_header);
+int StartSendingFrame_SEND(stomp_connection_t *sc, char *controller_queue, char *agent_queue, mtp_send_item_t *msi);
 int StartSendingFrame_UNSUBSCRIBE(stomp_connection_t *sc);
+int StartSendingFrame_DISCONNECT(stomp_connection_t *sc);
 char *AddrInfoToStr(struct addrinfo *addr, char *buf, int len);
 void UpdateNextHeartbeatTime(stomp_connection_t *sc);
 int UpdateMgmtInterface(void);
@@ -282,6 +277,7 @@ void HandleStompSourceIPAddrChanges(void);
 bool IsUspRecordInStompQueue(stomp_connection_t *sc, unsigned char *pbuf, int pbuf_len);
 void RemoveExpiredStompMessages(stomp_connection_t *sc);
 void RemoveStompQueueItem(stomp_connection_t *sc, stomp_send_item_t *queued_msg);
+void QueueUspConnectRecord_STOMP(stomp_connection_t *sc, mtp_send_item_t *msi, char *controller_queue, char *agent_queue, time_t expiry_time);
 int HandleStompRunningState(stomp_connection_t *sc, socket_set_t *set);
 int GetNextStompMsgToSend(stomp_connection_t *sc);
 
@@ -338,6 +334,8 @@ void STOMP_Destroy(void)
     int i;
     stomp_connection_t *sc;
 
+    OS_UTILS_LockMutex(&stomp_access_mutex);  // Ensure that the data model is held off accessing this module's data structures until after we have destroyed them
+
     for (i=0; i<MAX_STOMP_CONNECTIONS; i++)
     {
         sc = &stomp_connections[i];
@@ -352,6 +350,11 @@ void STOMP_Destroy(void)
     {
         SSL_CTX_free(stomp_ssl_ctx);
     }
+
+    // Prevent the data model from making any subsequent changes to the MTP thread
+    is_stomp_mtp_thread_exited = true;
+
+    OS_UTILS_UnlockMutex(&stomp_access_mutex);
 }
 
 /*********************************************************************//**
@@ -602,27 +605,23 @@ void STOMP_ProcessAllSocketActivity(socket_set_t *set)
 **
 ** STOMP_QueueBinaryMessage
 **
-** Function called to queue a message on the specified STOMP connection
+** Function called to queue a USP record on the specified STOMP connection
 **
-** \param   usp_msg_type - Type of USP message contained in pbuf. This is used for debug logging when the message is sent by the MTP.
+** \param   msi - pointer to content to send
+**                NOTE: Ownership of the payload buffer passes to this function, unless an error is returned
 ** \param   instance - instance number of the stomp connection in Device.STOMP.Connection.{i}
 ** \param   controller_queue - name of STOMP queue to send this message to
 ** \param   agent_queue - name of agent's STOMP queue configured for this connection in the data model
-** \param   pbuf - pointer to buffer containing binary protobuf message. Ownership of this buffer passes to this code, if successful
-** \param   pbuf_len - length of buffer containing protobuf binary message
-** \param   content_type - Type of content in the pbuf buffer
-** \param   err_id_header - pointer to string containing the STOMP usp-err-id header
-** \param   expiry_time - time at which the USP message should be removed from the MTP send queue
+** \param   expiry_time - time at which the USP record should be removed from the MTP send queue
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int STOMP_QueueBinaryMessage(Usp__Header__MsgType usp_msg_type, int instance, char *controller_queue, char *agent_queue,
-                             unsigned char *pbuf, int pbuf_len, mtp_content_type_t content_type, char *err_id_header, time_t expiry_time)
+int STOMP_QueueBinaryMessage(mtp_send_item_t *msi, int instance, char *controller_queue, char *agent_queue, time_t expiry_time)
 {
     stomp_connection_t *sc;
     stomp_send_item_t *send_item;
-    int err;
+    int err = USP_ERR_GENERAL_FAILURE;
     bool is_duplicate;
 
     OS_UTILS_LockMutex(&stomp_access_mutex);
@@ -630,6 +629,7 @@ int STOMP_QueueBinaryMessage(Usp__Header__MsgType usp_msg_type, int instance, ch
     // Exit if MTP thread has exited
     if (is_stomp_mtp_thread_exited)
     {
+        USP_FREE(msi->pbuf);
         OS_UTILS_UnlockMutex(&stomp_access_mutex);
         return USP_ERR_OK;
     }
@@ -643,11 +643,20 @@ int STOMP_QueueBinaryMessage(Usp__Header__MsgType usp_msg_type, int instance, ch
         goto exit;
     }
 
+    // Exit if this is a connect record, adding it at the front of the queue
+    if (msi->content_type == kMtpContentType_ConnectRecord)
+    {
+        QueueUspConnectRecord_STOMP(sc, msi, controller_queue, agent_queue, expiry_time);
+        err = USP_ERR_OK;
+        goto exit;
+    }
+
     // Do not add this message to the queue, if it is already present in the queue
     // This situation could occur if a notify is being retried to be sent, but is already held up in the queue pending sending
-    is_duplicate = IsUspRecordInStompQueue(sc, pbuf, pbuf_len);
+    is_duplicate = IsUspRecordInStompQueue(sc, msi->pbuf, msi->pbuf_len);
     if (is_duplicate)
     {
+        USP_FREE(msi->pbuf);
         err = USP_ERR_OK;
         goto exit;
     }
@@ -660,13 +669,9 @@ int STOMP_QueueBinaryMessage(Usp__Header__MsgType usp_msg_type, int instance, ch
 
     // Add the item to the queue
     send_item = USP_MALLOC(sizeof(stomp_send_item_t));
-    send_item->usp_msg_type = usp_msg_type;
-    send_item->pbuf = pbuf;
-    send_item->pbuf_len = pbuf_len;
+    send_item->item = *msi;  // NOTE: Ownership of the payload buffer passes to the STOMP message queue
     send_item->controller_queue = USP_STRDUP(controller_queue);
     send_item->agent_queue = USP_STRDUP(agent_queue);
-    send_item->content_type = content_type;
-    send_item->err_id_header = USP_STRDUP(err_id_header);
     send_item->expiry_time = expiry_time;
 
     DLLIST_LinkToTail(&sc->usp_record_send_queue, send_item);
@@ -683,6 +688,50 @@ exit:
     }
 
     return err;
+}
+
+/*********************************************************************//**
+**
+** STOMP_AllowConnect
+**
+** Called to start all client connections which were not allowed to connect before
+** and were being held in an indefinite retrying state
+**
+** \param   None
+**
+** \return  None
+**
+**************************************************************************/
+void STOMP_AllowConnect(void)
+{
+    int i;
+    stomp_connection_t *sc;
+
+    OS_UTILS_LockMutex(&stomp_access_mutex);
+
+    // Exit if MTP thread has exited
+    if (is_stomp_mtp_thread_exited)
+    {
+        OS_UTILS_UnlockMutex(&stomp_access_mutex);
+        return;
+    }
+
+    // Iterate over all STOMP connections, releasing all that were not allowed to connect before from the retrying state
+    // by timing out the retrying state. This will then cause them to attempt to connect
+    for (i=0; i<MAX_STOMP_CONNECTIONS; i++)
+    {
+        sc = &stomp_connections[i];
+        if ((sc->instance != INVALID) && (sc->state == kStompState_Retrying))
+        {
+            sc->retry_time = time(NULL);
+        }
+    }
+
+    OS_UTILS_UnlockMutex(&stomp_access_mutex);
+
+    // Cause the MTP thread to wakeup from select() and start connecting
+    // We do this outside of the mutex lock to avoid an unnecessary task switch
+    MTP_EXEC_StompWakeup();
 }
 
 /*********************************************************************//**
@@ -736,7 +785,11 @@ int STOMP_EnableConnection(stomp_conn_params_t *sp, char *stomp_queue)
     sc->retry_count = 0;
     sc->failure_code = kStompFailure_None;
 
-    StartStompConnection(sc);
+    // Put the connection into an immediate retrying state, so that the STOMP thread can perform the actual connection
+    // We don't attempt to perform the connection here, as trying to connect can block for upto STOMP_HANDSHAKE_TIMEOUT if the STOMP broker does not respond
+    CopyStompConnParamsFromNext(sc);
+    sc->state = kStompState_Retrying;
+    sc->retry_time = time(NULL);
     err = USP_ERR_OK;
 
 exit:
@@ -882,6 +935,7 @@ void STOMP_ScheduleReconnect(stomp_conn_params_t *sp, char *stomp_queue)
     // Signal a reconnect (which overrides any scheduled resubscribe)
     sc->schedule_reconnect = kScheduledAction_Signalled;
     sc->schedule_resubscribe = kScheduledAction_Off;
+    mtp_reconnect_scheduled = true;     // Set flag to ensure that data model thread subsequently calls STOMP_ActivateScheduledActions()
 
     // No need to perform a resubscribe, if we're reconnecting anyway
     // NOTE: The resubscribe flags could have been set if the agent queue was changed in the same USP set transaction as the other STOMP parameters
@@ -997,6 +1051,7 @@ void STOMP_ScheduleResubscribe(int instance, char *stomp_queue)
         if ((sc->subscribe_dest == NULL) && (sc->schedule_reconnect == kScheduledAction_Off))
         {
             sc->schedule_resubscribe = kScheduledAction_Signalled;
+            mtp_reconnect_scheduled = true;     // Set flag to ensure that data model thread subsequently calls STOMP_ActivateScheduledActions()
         }
     }
 
@@ -1041,6 +1096,7 @@ void STOMP_UpdateRetryParams(int instance, stomp_retry_params_t *retry_params)
 
     // Copy across the connection parameters to use during a retry
     memcpy(&sc->retry, retry_params, sizeof(stomp_retry_params_t));
+    memcpy(&sc->next_conn_params.retry, retry_params, sizeof(stomp_retry_params_t));
 
 exit:
     OS_UTILS_UnlockMutex(&stomp_access_mutex);
@@ -1242,17 +1298,24 @@ void StartStompConnection(stomp_connection_t *sc)
     nu_ipaddr_t local_mgmt_addr;
     stomp_failure_t stomp_err = kStompFailure_OtherError;
     char *mgmt_interface = "any";   // Used only for debug purposes
+    bool allowed;
 
     // Copy across the next connection parameters to use into the working state
     CopyStompConnParamsFromNext(sc);
 
+    // Exit, putting the connection into an immediate retrying state, if it's not allowed to start connecting yet
+    allowed = DEVICE_CONTROLLER_CanMtpConnect();
+    if (allowed == false)
+    {
+        InitStompConnection(sc);
+        sc->state = kStompState_Retrying;
+        sc->retry_time = time(NULL) + CAN_MTP_CONNECT_RETRY_TIME;
+        return;
+    }
+
 #ifdef CONNECT_ONLY_OVER_WAN_INTERFACE
     mgmt_interface = nu_macaddr_wan_ifname();
 #endif
-
-    USP_LOG_Info("Attempting to connect to host=%s (port=%d, %s) from interface=%s", sc->host, sc->port,
-                    (sc->enable_encryption) ? "encrypted" : "unencrypted",
-                    mgmt_interface);
 
     // Initialise state
     InitStompConnection(sc);
@@ -1287,6 +1350,11 @@ void StartStompConnection(stomp_connection_t *sc)
         stomp_err = kStompFailure_ServerDNS;
         goto exit;
     }
+
+    USP_LOG_Info("Attempting to connect to host=%s (ipaddr=%s, port=%d, %s) from interface=%s",
+                    sc->host, nu_ipaddr_str(&dst, buf, sizeof(buf)), sc->port,
+                    (sc->enable_encryption) ? "encrypted" : "unencrypted",
+                    mgmt_interface);
 
     // Exit if unable to make a socket address structure to contact the STOMP server
     err = nu_ipaddr_to_sockaddr(&dst, sc->port, &saddr, &saddr_len);
@@ -1397,7 +1465,7 @@ void StartStompConnection(stomp_connection_t *sc)
     else
     {
         // If encryption is off, then use the Non SSL role
-        sc->role = ROLE_NON_SSL;
+        sc->role_instance = ROLE_NON_SSL;
     }
 
     // Update the address used to connect to the controller
@@ -1481,8 +1549,7 @@ void StopStompConnection(stomp_connection_t *sc, bool purge_queued_messages)
     sc->socket_fd = -1;
     sc->ssl = NULL;
     sc->cert_chain = NULL;
-    USP_SAFE_FREE(sc->allowed_controllers);
-    sc->role = ROLE_DEFAULT;
+    sc->role_instance = ROLE_DEFAULT;
     USP_SAFE_FREE(sc->subscribe_dest);
     sc->agent_heartbeat_period = 0;
     sc->server_heartbeat_period = 0;
@@ -1544,9 +1611,8 @@ void InitStompConnection(stomp_connection_t *sc)
     sc->socket_fd = -1;
     sc->ssl = NULL;
     sc->cert_chain = NULL;
-    sc->role = ROLE_DEFAULT;
+    sc->role_instance = ROLE_DEFAULT;
     sc->subscribe_dest = NULL;
-    sc->allowed_controllers = NULL;
 
     sc->agent_heartbeat_period = 0;
     sc->server_heartbeat_period = 0;
@@ -1624,7 +1690,11 @@ int PerformStompSslConnect(stomp_connection_t *sc)
 
     // Exit if the handshake was successful, but the server did not provide a certificate
     // This might occur if an insecure anonymous cipher suite is being used
+#if OPENSSL_VERSION_NUMBER >= 0x3000000FL // SSL version 3.0.0
+    server_cert = SSL_get1_peer_certificate(sc->ssl);
+#else
     server_cert = SSL_get_peer_certificate(sc->ssl);
+#endif
     if (server_cert == NULL)
     {
         USP_LOG_Error("%s: SSL_get_peer_certificate() failed", __FUNCTION__);
@@ -1638,7 +1708,7 @@ int PerformStompSslConnect(stomp_connection_t *sc)
     if (sc->cert_chain != NULL)
     {
         // Exit if unable to determine the role associated with the trusted root cert
-        err = DEVICE_SECURITY_GetControllerTrust(sc->cert_chain, &sc->role, &sc->allowed_controllers);
+        err = DEVICE_SECURITY_GetControllerTrust(sc->cert_chain, &sc->role_instance);
         if (err != USP_ERR_OK)
         {
             return err;
@@ -1817,7 +1887,7 @@ void UpdateStompConnectionSockSet(stomp_connection_t *sc, socket_set_t *set)
             else
             {
                 // Wait until it's time to retry
-                SOCKET_SET_UpdateTimeout(timeout*SECONDS, set);   // Retry in 5 seconds time
+                SOCKET_SET_UpdateTimeout(timeout*SECONDS, set);
             }
             break;
 
@@ -1921,7 +1991,7 @@ int GetNextStompMsgToSend(stomp_connection_t *sc)
         queued_msg = (stomp_send_item_t *) sc->usp_record_send_queue.head;
         if (queued_msg != NULL)
         {
-            err = StartSendingFrame_SEND(sc, queued_msg->controller_queue, queued_msg->agent_queue, queued_msg->usp_msg_type, queued_msg->pbuf, queued_msg->pbuf_len, queued_msg->content_type, queued_msg->err_id_header);
+            err = StartSendingFrame_SEND(sc, queued_msg->controller_queue, queued_msg->agent_queue, &queued_msg->item);
         }
     }
 
@@ -2114,6 +2184,9 @@ int TransmitStompMessage(stomp_connection_t *sc)
     int num_bytes_sent;
     unsigned char *buf;
     int bytes_to_attempt;
+    char *agent_queue;
+    stomp_send_item_t *cur_msg;
+    mtp_content_type_t type;
 
     // Determine what to send
     buf = &sc->txframe[ sc->txframe_sent_count ];
@@ -2160,7 +2233,19 @@ int TransmitStompMessage(stomp_connection_t *sc)
     // Also, if it contained an embedded USP message, then remove that from the send queue
     if (sc->txframe_contains_usp_record)
     {
-        RemoveStompQueueItem(sc, (stomp_send_item_t *) sc->usp_record_send_queue.head);
+        // Remove the USP message from the send queue
+        cur_msg = (stomp_send_item_t *) sc->usp_record_send_queue.head;
+        type = cur_msg->item.content_type;  // Save content_type, before freeing the message
+        RemoveStompQueueItem(sc, cur_msg);
+
+        // If the USP message was a Disconnect record, then close the socket and go into the retrying state
+        // NOTE: USP Disconnect records closing an E2E session (kMtpContentType_E2E_SessTermination) do not close the connection
+        if (type == kMtpContentType_DisconnectRecord)
+        {
+            StartSendingFrame_DISCONNECT(sc);
+            TransmitStompMessage(sc);
+            HandleStompSocketError(sc, kStompFailure_OtherError);
+        }
     }
 
     // Move to next state (if required)
@@ -2175,10 +2260,10 @@ int TransmitStompMessage(stomp_connection_t *sc)
             sc->failure_code = kStompFailure_None;  // The reason this is set here is that we don't want to change the previous Connection.{i}.Status until it becomes successful
             sc->last_status_change = time(NULL);
             sc->retry_count = 0;        // Since successful, reset the retry count
-
             // Notify the data model of the role to use for controllers connected to this STOMP connection
             // This will also unblock the Boot! event, subscriptions, and restarting of operations
-            DM_EXEC_PostStompHandshakeComplete(sc->instance, sc->role, sc->allowed_controllers);
+            agent_queue = (sc->subscribe_dest != NULL) ? sc->subscribe_dest : sc->provisionned_queue;
+            DM_EXEC_PostStompHandshakeComplete(sc->instance, agent_queue, sc->role_instance);
             break;
 
         default:
@@ -2579,7 +2664,7 @@ void RemoveReceivedHeartBeats(stomp_connection_t *sc)
     // Determine how many bytes are heartbeat messages
     p = sc->rxframe;
     heartbeat_bytes = 0;
-    while ((*p == '\n') && (heartbeat_bytes < len))
+    while ((heartbeat_bytes < len) && (*p == '\n'))
     {
         heartbeat_bytes++;
         p++;
@@ -2798,6 +2883,9 @@ void HandleRxMsg_AwaitingConnectedFrameState(stomp_connection_t *sc, int msg_siz
     err = StartSendingFrame_SUBSCRIBE(sc);
     if (err != USP_ERR_OK)
     {
+        // Attempt to send disconnect frame before closing the socket
+        StartSendingFrame_DISCONNECT(sc);
+        TransmitStompMessage(sc);
         HandleStompSocketError(sc, kStompFailure_Misconfigured);
         return;
     }
@@ -2829,8 +2917,7 @@ void HandleRxMsg_RunningState(stomp_connection_t *sc, int msg_size)
     char content_type[64];
     bool is_present;
     char time_buf[MAX_ISO8601_LEN];
-    mtp_reply_to_t mtp_reply_to = {0};
-    char err_id_header[MAX_STOMP_HEADER_VALUE_LEN];
+    mtp_conn_t mtp_conn = {0};
 
     // Exit if this is not the expected MESSAGE frame
     if (IsFrame("MESSAGE", sc->rxframe, msg_size) == false)
@@ -2848,32 +2935,20 @@ void HandleRxMsg_RunningState(stomp_connection_t *sc, int msg_size)
         return;
     }
 
-    // Extract the 'usp-err-id' header (if not present, it will be an empty string)
-    err_id_header[0] = '\0';
-    GetStompHeaderValue("usp-err-id:", sc->rxframe, msg_size, err_id_header, sizeof(err_id_header));
-    mtp_reply_to.stomp_err_id = err_id_header;
-
-    // Fill In the mtp_reply_to_t structure, based on whether we have a 'reply-to' field or not
-    mtp_reply_to.protocol = kMtpProtocol_STOMP;
+    // Fill In the mtp_conn_t structure, based on whether we have a 'reply-to' field or not
+    mtp_conn.protocol = kMtpProtocol_STOMP;
+    mtp_conn.stomp.instance = sc->instance;
     is_present = GetStompHeaderValue("reply-to-dest:", sc->rxframe, msg_size, reply_to_dest, sizeof(reply_to_dest));
     if ((is_present) && (reply_to_dest[0] != '\0'))
     {
-        mtp_reply_to.is_reply_to_specified = true;
-        mtp_reply_to.stomp_dest = reply_to_dest;
-        mtp_reply_to.stomp_instance = sc->instance;
+        mtp_conn.is_reply_to_specified = true;
+        mtp_conn.stomp.dest = reply_to_dest;
     }
 
     // Check the content-type
     is_present = GetStompHeaderValue("content-type:", sc->rxframe, msg_size, content_type, sizeof(content_type));
     if (is_present)
     {
-        // Ignore all "application/vnd.bbf.usp.error" frames
-        if (strcmp(content_type, BBF_STOMP_ERROR_CONTENT_TYPE) == 0)
-        {
-            USP_LOG_Warning("%s: Ignoring STOMP frame with content-type=%s on connection to (host %s, port %d)", __FUNCTION__, content_type, sc->host, sc->port);
-            return;
-        }
-
         // Only allow "application/vnd.bbf.usp.msg" fames
         if (strcmp(content_type, BBF_STOMP_CONTENT_TYPE) != 0)
         {
@@ -2914,7 +2989,7 @@ void HandleRxMsg_RunningState(stomp_connection_t *sc, int msg_size)
     USP_PROTOCOL("%s", &sc->rxframe[offset]);
 
     // Send the USP Record to the data model thread for processing
-    DM_EXEC_PostUspRecord(pbuf, pbuf_len, sc->role, sc->allowed_controllers, &mtp_reply_to);
+    DM_EXEC_PostUspRecord(pbuf, pbuf_len, UNKNOWN_ENDPOINT_ID, sc->role_instance, &mtp_conn);
 }
 
 /*********************************************************************//**
@@ -3224,7 +3299,9 @@ int StartSendingFrame_STOMP(stomp_connection_t *sc)
     char heartbeat_args[64];
     char password_args[256];
     char debug_pw_args[256];
-    char escaped_endpoint_id[256];
+    char escaped_endpoint_id[MAX_ENDPOINT_ID_LEN];
+    char escaped_username[256];
+    char escaped_password[256];
     char *endpoint_id;
 
     // Write the heartbeat header arguments into a buffer (if enabled)
@@ -3242,8 +3319,10 @@ int StartSendingFrame_STOMP(stomp_connection_t *sc)
     password_args[0] = '\0';
     if ((sc->username != NULL) && (sc->username[0] != '\0') && (sc->password != NULL) && (sc->password[0] != '\0'))
     {
-        USP_SNPRINTF(password_args, sizeof(password_args), "login:%s\npasscode:%s\n", sc->username, sc->password);
-        USP_SNPRINTF(debug_pw_args, sizeof(debug_pw_args), "login:%s\npasscode:\n", sc->username);
+        EscapeStompHeader(sc->username, escaped_username, sizeof(escaped_username));
+        EscapeStompHeader(sc->password, escaped_password, sizeof(escaped_password));
+        USP_SNPRINTF(password_args, sizeof(password_args), "login:%s\npasscode:%s\n", escaped_username, escaped_password);
+        USP_SNPRINTF(debug_pw_args, sizeof(debug_pw_args), "login:%s\npasscode:\n", escaped_username);
     }
     else
     {
@@ -3360,22 +3439,20 @@ int StartSendingFrame_SUBSCRIBE(stomp_connection_t *sc)
 ** \param   sc - pointer to STOMP connection
 ** \param   controller_queue - name of STOMP queue to send this message to
 ** \param   agent_queue - name of agent's STOMP queue configured for this connection in the data model
-** \param   usp_msg_type - Type of USP message contained in pbuf. This is used for debug logging when the message is sent by the MTP.
-** \param   pbuf - pointer to buffer containing message in binary format
-** \param   pbuf_len - length of protobuf message buffer
-** \param   content_type - type of content in the pbuf buffer
-** \param   err_id_header - pointer to buffer containing the value of the 'usp-err-id' STOMP header to put in the message
+** \param   msi - Information about the content to send. The ownership of
+**                          the payload buffer is not passed to this function and stays with the caller.
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int StartSendingFrame_SEND(stomp_connection_t *sc, char *controller_queue, char *agent_queue, Usp__Header__MsgType usp_msg_type, unsigned char *pbuf, int pbuf_len, mtp_content_type_t content_type, char *err_id_header)
+int StartSendingFrame_SEND(stomp_connection_t *sc, char *controller_queue, char *agent_queue, mtp_send_item_t *msi)
 {
     unsigned char *buf;
     int len;                    // Total number of bytes in the entire STOMP frame including NULL terminator
     int body_offset;            // Offset from the start of the STOMP message (in bytes) to the message's body (which will contain the google protocol buf encoded USP message)
     char content_length[16];    // Temporary string containing the content length digits
     char *content_type_str;
+    USP_ASSERT(msi != NULL);
 
     // Exit if unable to get the name of the controller's queue on this connection
     if ((controller_queue == NULL) || (*controller_queue == '\0'))
@@ -3398,40 +3475,36 @@ int StartSendingFrame_SEND(stomp_connection_t *sc, char *controller_queue, char 
         return USP_ERR_INTERNAL_ERROR;
     }
 
-    content_type_str = (content_type==kMtpContentType_UspRecord) ? BBF_STOMP_CONTENT_TYPE : BBF_STOMP_ERROR_CONTENT_TYPE;
+    content_type_str = BBF_STOMP_CONTENT_TYPE;
 
     // Determine the size of the USP message
-    USP_SNPRINTF(content_length, sizeof(content_length), "%d", pbuf_len);
-
+    USP_SNPRINTF(content_length, sizeof(content_length), "%d", msi->pbuf_len);
     #define SEND_FRAME_FORMAT   "SEND\n" \
                                 "content-length:%s\n" \
                                 "content-type:%s\n"   \
-                                "usp-err-id:%s\n"     \
                                 "reply-to-dest:%s\n"  \
                                 "destination:%s"
 
     // Allocate buffer to store the frame in
     #define STOMP_BODY_SEPARATOR "\n\n"
-    USP_ASSERT(err_id_header != NULL);
     len = sizeof(SEND_FRAME_FORMAT) +
           strlen(content_length) +
           strlen(content_type_str) +
-          strlen(err_id_header) +
           strlen(agent_queue) +
-          strlen(controller_queue) - 10 + // Minus 10 to remove all "%s" from the frame
+          strlen(controller_queue) - 8 + // Minus 8 to remove all "%s" from the frame
           sizeof(STOMP_BODY_SEPARATOR)-1 + // Minus 1 to not include NULL terminator in STOMP_BODY_SEPARATOR
-          pbuf_len;
+          msi->pbuf_len;
     buf = USP_MALLOC(len);
 
     // Form the STOMP headers
-    body_offset = USP_SNPRINTF((char *)buf, len, SEND_FRAME_FORMAT, content_length, content_type_str, err_id_header, agent_queue, controller_queue);
+    body_offset = USP_SNPRINTF((char *)buf, len, SEND_FRAME_FORMAT, content_length, content_type_str, agent_queue, controller_queue);
 
-    MSG_HANDLER_LogMessageToSend(usp_msg_type, pbuf, pbuf_len, kMtpProtocol_STOMP, sc->host, buf, content_type);
+    MSG_HANDLER_LogMessageToSend(msi, kMtpProtocol_STOMP, sc->host, (char *)buf);
 
     // Form the STOMP body
     memcpy(&buf[body_offset], STOMP_BODY_SEPARATOR, sizeof(STOMP_BODY_SEPARATOR)-1);
     body_offset += 2;
-    memcpy(&buf[body_offset], pbuf, pbuf_len);
+    memcpy(&buf[body_offset], msi->pbuf, msi->pbuf_len);
 
     // Terminate the STOMP message
     buf[len-1] = '\0';
@@ -3476,6 +3549,47 @@ int StartSendingFrame_UNSUBSCRIBE(stomp_connection_t *sc)
 
     // Form the UNSUBSCRIBE frame
     USP_SNPRINTF(((char *)buf), len, UNSUBSCRIBE_FRAME_FORMAT);
+    USP_PROTOCOL("%s", buf);
+
+    // Save the frame to transmit
+    USP_ASSERT(sc->txframe == NULL);
+    sc->txframe = buf;
+    sc->txframe_len = len;
+    sc->txframe_sent_count = 0;
+    sc->txframe_contains_usp_record = false;
+
+    return USP_ERR_OK;
+}
+
+/*********************************************************************//**
+**
+** StartSendingFrame_DISCONNECT
+**
+** Creates a DISCONNECT frame, and sets up state to transmit it
+**
+** \param   sc - pointer to STOMP connection
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int StartSendingFrame_DISCONNECT(stomp_connection_t *sc)
+{
+    unsigned char *buf;
+    int len;
+
+    USP_LOG_Info("Sending DISCONNECT frame to (host=%s, port=%d)", sc->host, sc->port);
+
+    // NOTE: We do not open multiple subscriptions with the server, hence the "id:" header can be hardcoded
+    #define DISCONNECT_FRAME_FORMAT  "DISCONNECT\n" \
+                                      "\n"        \
+                                      EMPTY_BODY
+
+    // Allocate buffer to store the frame in
+    len = sizeof(DISCONNECT_FRAME_FORMAT);
+    buf = USP_MALLOC(len);
+
+    // Form the DISCONNECT frame
+    USP_SNPRINTF(((char *)buf), len, DISCONNECT_FRAME_FORMAT);
     USP_PROTOCOL("%s", buf);
 
     // Save the frame to transmit
@@ -3572,6 +3686,18 @@ void EscapeStompHeader(char *src, char *dest, int dest_len)
         {
             *dest++ = '\\';
             *dest++ = '\\';
+            dest_len -= 2;
+        }
+        else if (c == '\r')
+        {
+            *dest++ = '\\';
+            *dest++ = 'r';
+            dest_len -= 2;
+        }
+        else if (c == '\n')
+        {
+            *dest++ = '\\';
+            *dest++ = 'n';
             dest_len -= 2;
         }
         else
@@ -3999,7 +4125,7 @@ void RemoveExpiredStompMessages(stomp_connection_t *sc)
     stomp_send_item_t *queued_msg;
     stomp_send_item_t *next_msg;
 
-    USP_ASSERT(sc->txframe == NULL);    // This function must not remove the current frame being transmitted whilst is is being transmitted
+    USP_ASSERT(sc->txframe == NULL);    // This function must not remove the current frame being transmitted whilst it is being transmitted
 
     cur_time = time(NULL);
     queued_msg = (stomp_send_item_t *) sc->usp_record_send_queue.head;
@@ -4034,8 +4160,7 @@ void RemoveStompQueueItem(stomp_connection_t *sc, stomp_send_item_t *queued_msg)
     // Free all dynamically allocated member variables
     USP_FREE(queued_msg->controller_queue);
     USP_FREE(queued_msg->agent_queue);
-    USP_FREE(queued_msg->pbuf);
-    USP_FREE(queued_msg->err_id_header);
+    USP_FREE(queued_msg->item.pbuf);
 
     // Remove the specified item from the queue, and free the item itself
     DLLIST_Unlink(&sc->usp_record_send_queue, queued_msg);
@@ -4065,7 +4190,7 @@ bool IsUspRecordInStompQueue(stomp_connection_t *sc, unsigned char *pbuf, int pb
     while (queued_msg != NULL)
     {
         // Exit if the USP record is already in the queue
-        if ((queued_msg->pbuf_len == pbuf_len) && (memcmp(queued_msg->pbuf, pbuf, pbuf_len)==0))
+        if ((queued_msg->item.pbuf_len == pbuf_len) && (memcmp(queued_msg->item.pbuf, pbuf, pbuf_len)==0))
         {
              return true;
         }
@@ -4076,6 +4201,58 @@ bool IsUspRecordInStompQueue(stomp_connection_t *sc, unsigned char *pbuf, int pb
 
     // If the code gets here, then the USP record is not in the queue
     return false;
+}
+
+/*********************************************************************//**
+**
+** QueueUspConnectRecord_STOMP
+**
+** Adds the USP connect record at the front of the queue, ensuring that there is only one connect record in the queue
+**
+** \param   sc - stomp connection which has USP records queued to send
+** \param   msi - pointer to content to send
+**                NOTE: Ownership of the payload buffer passes to this function
+** \param   controller_queue - name of STOMP queue to send this message to
+** \param   agent_queue - name of agent's STOMP queue configured for this connection in the data model
+** \param   expiry_time - time at which the USP record should be removed from the MTP send queue
+**
+** \return  None
+**
+**************************************************************************/
+void QueueUspConnectRecord_STOMP(stomp_connection_t *sc, mtp_send_item_t *msi, char *controller_queue, char *agent_queue, time_t expiry_time)
+{
+    stomp_send_item_t *cur_msg;
+    stomp_send_item_t *next_msg;
+    stomp_send_item_t *send_item;
+    mtp_content_type_t type;
+
+    // Iterate over USP Records in the queue, removing all stale connect and disconnect records to the specified controller
+    // A connect or disconnect record may still be in the queue if the connection failed before the record was fully sent
+    cur_msg = (stomp_send_item_t *) sc->usp_record_send_queue.head;
+    while (cur_msg != NULL)
+    {
+        // Save pointer to next message, as we may remove the current message
+        next_msg = (stomp_send_item_t *) cur_msg->link.next;
+
+        // Remove current message if it is a connect or disconnect record for the controller
+        type = cur_msg->item.content_type;
+        if (IsUspConnectOrDisconnectRecord(type) && (strcmp(cur_msg->controller_queue, controller_queue)==0))
+        {
+            RemoveStompQueueItem(sc, cur_msg);
+        }
+
+        // Move to next message in the queue
+        cur_msg = next_msg;
+    }
+
+    // Add the new connect record to the queue
+    send_item = USP_MALLOC(sizeof(stomp_send_item_t));
+    send_item->item = *msi;  // NOTE: Ownership of the payload buffer passes to the STOMP message queue
+    send_item->controller_queue = USP_STRDUP(controller_queue);
+    send_item->agent_queue = USP_STRDUP(agent_queue);
+    send_item->expiry_time = expiry_time;
+
+    DLLIST_LinkToHead(&sc->usp_record_send_queue, send_item);
 }
 
 #endif // DISABLE_STOMP

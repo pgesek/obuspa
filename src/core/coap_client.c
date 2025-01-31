@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019, Broadband Forum
- * Copyright (C) 2017-2019  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2017-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -114,13 +114,11 @@ typedef struct
 coap_client_t coap_clients[MAX_COAP_CLIENTS];
 
 //------------------------------------------------------------------------------
-// USP Message to send in queue
+// Payload to send in CoAP queue
 typedef struct
 {
     double_link_t link;     // Doubly linked list pointers. These must always be first in this structure
-    Usp__Header__MsgType usp_msg_type;  // Type of USP message contained within pbuf
-    unsigned char *pbuf;    // Protobuf format message to send in binary format
-    int pbuf_len;           // Length of protobuf message to send
+    mtp_send_item_t item;   // Information about the content to send.
     char *host;             // Hostname of the controller to send to
     coap_config_t config;   // Port, resource and whether encryption is enabled
     bool coap_reset_session_hint;       // Set if an existing DTLS session with this host should be reset.
@@ -128,8 +126,7 @@ typedef struct
                                         // that the USP response must be sent back on a new DTLS session also. Wihout this,
                                         // the CoAP retry mechanism will cause the DTLS session to restart, but it is a while
                                         // before the retry is triggered, so this hint speeds up communications
-    time_t expiry_time;     // Time at which this message should be removed from the queue
-
+    time_t expiry_time;     // Time at which this USP record should be removed from the queue
 } coap_send_item_t;
 
 //------------------------------------------------------------------------------------
@@ -247,6 +244,11 @@ void COAP_CLIENT_Destroy(void)
         }
     }
 
+    // Free the OpenSSL context
+    if (coap_client_ssl_ctx != NULL)
+    {
+        SSL_CTX_free(coap_client_ssl_ctx);
+    }
 }
 
 /*********************************************************************//**
@@ -377,6 +379,49 @@ void COAP_CLIENT_Stop(int cont_instance, int mtp_instance)
 
 /*********************************************************************//**
 **
+** COAP_CLIENT_AllowConnect
+**
+** Called to start all client connections which were not allowed to connect before
+** and were being held in an indefinite retrying state
+**
+** \param   None
+**
+** \return  None
+**
+**************************************************************************/
+void COAP_CLIENT_AllowConnect(void)
+{
+    int i;
+    coap_client_t *cc;
+
+    COAP_LockMutex();
+
+    // Exit if MTP thread has exited
+    if (is_coap_mtp_thread_exited)
+    {
+        COAP_UnlockMutex();
+        return;
+    }
+
+    // Iterate over all CoAP client connections, releasing all that were not allowed to connect before from the retrying state
+    // by timing out the retrying state. This will then cause them to attempt to connect
+    for (i=0; i<MAX_COAP_CLIENTS; i++)
+    {
+        cc = &coap_clients[i];
+        if ((cc->cont_instance != INVALID) && (cc->reconnect_time != INVALID_TIME))
+        {
+            cc->reconnect_time = time(NULL);
+        }
+    }
+
+    COAP_UnlockMutex();
+
+    // Cause the MTP thread to wakeup from select() and start connecting
+    // We do this outside of the mutex lock to avoid an unnecessary task switch
+    MTP_EXEC_CoapWakeup();
+}
+/*********************************************************************//**
+**
 ** COAP_CLIENT_UpdateAllSockSet
 **
 ** Updates the set of all COAP socket fds to read/write from
@@ -391,7 +436,7 @@ void COAP_CLIENT_UpdateAllSockSet(socket_set_t *set)
     int i;
     coap_client_t *cc;
     time_t cur_time;
-    int timeout;        // timeout in milliseconds
+    int timeout;  // in seconds
 
     cur_time = time(NULL);
     #define CALC_TIMEOUT(res, t) res = t - cur_time; if (res < 0) { res = 0; }
@@ -491,25 +536,25 @@ void COAP_CLIENT_ProcessAllSocketActivity(socket_set_t *set)
 **
 ** COAP_CLIENT_QueueBinaryMessage
 **
-** Function called to queue a message to send to the specified controller (over CoAP)
+** Function called to queue a USP record to send to the specified controller (over CoAP)
 **
-** \param   usp_msg_type - Type of USP message contained in pbuf. This is used for debug logging when the message is sent by the MTP.
+** \param   msi - Information about the content to send. The ownership of
+**                the payload buffer is passed to this function.
 ** \param   cont_instance -  Instance number of the controller in Device.LocalAgent.Controller.{i}
 ** \param   mtp_instance -   Instance number of this MTP in Device.LocalAgent.Controller.{i}.MTP.{i}
-** \param   pbuf - pointer to buffer containing binary protobuf message. Ownership of this buffer passes to this code, if successful
-** \param   pbuf_len - length of buffer containing protobuf binary message
-** \param   mrt - pointer to structure containing CoAP parameters describing CoAP destination to send to
-** \param   expiry_time - time at which the USP message should be removed from the MTP send queue
+** \param   mtpc - pointer to structure containing CoAP parameters describing CoAP destination to send to
+** \param   expiry_time - time at which the USP record should be removed from the MTP send queue
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int COAP_CLIENT_QueueBinaryMessage(Usp__Header__MsgType usp_msg_type, int cont_instance, int mtp_instance, unsigned char *pbuf, int pbuf_len, mtp_reply_to_t *mrt, time_t expiry_time)
+int COAP_CLIENT_QueueBinaryMessage(mtp_send_item_t *msi, int cont_instance, int mtp_instance, mtp_conn_t *mtpc, time_t expiry_time)
 {
     coap_client_t *cc;
     coap_send_item_t *csi;
-    int err;
+    int err = USP_ERR_GENERAL_FAILURE;
     bool is_duplicate;
+    USP_ASSERT(msi != NULL);
 
     COAP_LockMutex();
 
@@ -518,6 +563,7 @@ int COAP_CLIENT_QueueBinaryMessage(Usp__Header__MsgType usp_msg_type, int cont_i
     if (is_coap_mtp_thread_exited)
     {
         COAP_UnlockMutex();
+        USP_FREE(msi->pbuf);
         return USP_ERR_OK;
     }
 
@@ -532,9 +578,10 @@ int COAP_CLIENT_QueueBinaryMessage(Usp__Header__MsgType usp_msg_type, int cont_i
 
     // Do not add this message to the queue, if it is already present in the queue
     // This situation could occur if a notify is being retried to be sent, but is already held up in the queue pending sending
-    is_duplicate = IsUspRecordInCoapQueue(cc, pbuf, pbuf_len);
+    is_duplicate = IsUspRecordInCoapQueue(cc, msi->pbuf, msi->pbuf_len);
     if (is_duplicate)
     {
+        USP_FREE(msi->pbuf);
         err = USP_ERR_OK;
         goto exit;
     }
@@ -544,14 +591,12 @@ int COAP_CLIENT_QueueBinaryMessage(Usp__Header__MsgType usp_msg_type, int cont_i
 
     // Add the item to the queue
     csi = USP_MALLOC(sizeof(coap_send_item_t));
-    csi->usp_msg_type = usp_msg_type;
-    csi->pbuf = pbuf;
-    csi->pbuf_len = pbuf_len;
-    csi->host = USP_STRDUP(mrt->coap_host);
-    csi->config.port = mrt->coap_port;
-    csi->config.resource = USP_STRDUP(mrt->coap_resource);
-    csi->config.enable_encryption = mrt->coap_encryption;
-    csi->coap_reset_session_hint = mrt->coap_reset_session_hint;
+    csi->item = *msi;  // NOTE: Ownership of the payload buffer passes to the CoAP client
+    csi->host = USP_STRDUP(mtpc->coap.host);
+    csi->config.port = mtpc->coap.port;
+    csi->config.resource = USP_STRDUP(mtpc->coap.resource);
+    csi->config.enable_encryption = mtpc->coap.encryption;
+    csi->coap_reset_session_hint = mtpc->coap.reset_session_hint;
     csi->expiry_time = expiry_time;
 
     DLLIST_LinkToTail(&cc->send_queue, csi);
@@ -647,7 +692,7 @@ void HandleCoapAck(coap_client_t *cc)
     // Exit if an error occurred whilst parsing the PDU
     memset(&pp, 0, sizeof(pp));
     pp.message_id = INVALID;
-    pp.mtp_reply_to.protocol = kMtpProtocol_CoAP;
+    pp.mtp_conn.protocol = kMtpProtocol_CoAP;
     action_flags = COAP_ParsePdu(buf, len, &pp);
     if (action_flags != COAP_NO_ERROR)
     {
@@ -805,7 +850,7 @@ unsigned CalcCoapClientActions(coap_client_t *cc, parsed_pdu_t *pp)
 
     // Exit if we got a 'Changed' response
     // NOTE: Changed response never contains a BLOCK1 option
-    sent_last_block = (cc->bytes_sent + cc->block_size >= csi->pbuf_len) ? true : false;
+    sent_last_block = (cc->bytes_sent + cc->block_size >= csi->item.pbuf_len) ? true : false;
     if (pp->request_response_code == kPduSuccessRespCode_Changed)
     {
         // Exit if we were not expecting a 'Changed' response, as we haven't sent all of the blocks
@@ -918,6 +963,7 @@ void StartSendingCoapUspRecord(coap_client_t *cc, unsigned flags)
     coap_send_item_t *csi;
     nu_ipaddr_t csi_peer_addr;
     bool prefer_ipv6;
+    bool allowed;
 
     // Drop the current queued USP Record (if required)
     if (flags & SEND_NEXT)
@@ -952,7 +998,15 @@ void StartSendingCoapUspRecord(coap_client_t *cc, unsigned flags)
     // Log the message, if we are not resending it
     if ((flags & RETRY_CURRENT) == 0)
     {
-        MSG_HANDLER_LogMessageToSend(csi->usp_msg_type, csi->pbuf, csi->pbuf_len, kMtpProtocol_CoAP, csi->host, NULL, kMtpContentType_UspRecord);
+        MSG_HANDLER_LogMessageToSend(&csi->item, kMtpProtocol_CoAP, csi->host, NULL);
+    }
+
+    // Exit, putting the client into an immediate retrying state, if it's not allowed to start connecting yet
+    allowed = DEVICE_CONTROLLER_CanMtpConnect();
+    if (allowed == false)
+    {
+        cc->reconnect_time = time(NULL) + CAN_MTP_CONNECT_RETRY_TIME;
+        return;
     }
 
     // Attempt to interpret the host as an IP literal address (ie no DNS lookup required)
@@ -1409,12 +1463,12 @@ int WriteCoapBlock(coap_client_t *cc, unsigned char *buf, int len)
     STORE_BYTE(content_format_option, kPduContentFormat_OctetStream);
 
     // Calculate the block option
-    bytes_remaining = csi->pbuf_len - cc->bytes_sent;
+    bytes_remaining = csi->item.pbuf_len - cc->bytes_sent;
     is_more_blocks = (bytes_remaining <= cc->block_size) ? 0 : 1;
     block_option_len = COAP_CalcBlockOption(block_option, cc->cur_block, is_more_blocks, cc->block_size);
 
     // Calculate the size option (this option contains the total size of the message)
-    STORE_2_BYTES(size_option, csi->pbuf_len);
+    STORE_2_BYTES(size_option, csi->item.pbuf_len);
 
     // Exit if unable to convert the destination address to a string literal
     err = nu_ipaddr_to_str(&cc->peer_addr, peer_addr_str, sizeof(peer_addr_str));
@@ -1485,7 +1539,7 @@ int WriteCoapBlock(coap_client_t *cc, unsigned char *buf, int len)
     WRITE_BYTE(p, PDU_OPTION_END_MARKER);
 
     // Write the payload into the output buffer
-    memcpy(p, &csi->pbuf[cc->bytes_sent], payload_size);
+    memcpy(p, &csi->item.pbuf[cc->bytes_sent], payload_size);
     p += payload_size;
 
     // Log a message
@@ -1680,7 +1734,7 @@ void FreeCoapSendItem(coap_client_t *cc, coap_send_item_t *csi)
     USP_ASSERT(csi != NULL);
 
     // Remove and free the specified item in the queue
-    USP_FREE(csi->pbuf);
+    USP_FREE(csi->item.pbuf);
     USP_FREE(csi->host);
     USP_FREE(csi->config.resource);
     DLLIST_Unlink(&cc->send_queue, csi);
@@ -1710,7 +1764,7 @@ bool IsUspRecordInCoapQueue(coap_client_t *cc, unsigned char *pbuf, int pbuf_len
     while (csi != NULL)
     {
         // Exit if the USP record is already in the queue
-        if ((csi->pbuf_len == pbuf_len) && (memcmp(csi->pbuf, pbuf, pbuf_len)==0))
+        if ((csi->item.pbuf_len == pbuf_len) && (memcmp(csi->item.pbuf, pbuf, pbuf_len)==0))
         {
              return true;
         }

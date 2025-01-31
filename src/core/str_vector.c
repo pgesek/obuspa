@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2020, Broadband Forum
- * Copyright (C) 2016-2020  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -188,6 +188,42 @@ int STR_VECTOR_Find(str_vector_t *sv, char *str)
 
 /*********************************************************************//**
 **
+** STR_VECTOR_RemoveByIndex
+**
+** Removes the specified entry from the vector
+**
+** \param   sv - pointer to structure to remove an entry from
+** \param   index - index of the string to remove from within the vector
+**
+** \return  None
+**
+**************************************************************************/
+void STR_VECTOR_RemoveByIndex(str_vector_t *sv, int index)
+{
+    int num_items_after;
+
+    // Remove the string at the specified index
+    USP_SAFE_FREE(sv->vector[index]);
+
+    // Move down all items in the vector after the one we just removed
+    num_items_after = sv->num_entries-1 - index;
+    if (num_items_after > 0)
+    {
+        memmove(&sv->vector[index], &sv->vector[index+1], num_items_after*sizeof(char *));
+    }
+
+    sv->num_entries--;
+
+    // Ensure that the vector is freed, if it now contains no entries
+    if (sv->num_entries == 0)
+    {
+        USP_FREE(sv->vector);
+        sv->vector = NULL;
+    }
+}
+
+/*********************************************************************//**
+**
 ** STR_VECTOR_Destroy
 **
 ** Deallocates all memory associated with the string vector
@@ -279,6 +315,91 @@ void STR_VECTOR_ConvertToKeyValueVector(str_vector_t *sv, kv_vector_t *kvv)
     USP_FREE(sv->vector);
     sv->vector = NULL;
     sv->num_entries = 0;
+}
+
+/*********************************************************************//**
+**
+** STR_VECTOR_ToSortedList
+**
+** Converts a string vector into a dynamically allocated string containing a comma separated list of sorted items
+** If there are no items in the list, then it returns NULL
+**
+** \param   sv - pointer to string vector source structure to convert
+**
+** \return  Dynamically allocated string containing comma separated list of all items in the string vector, or NULL if no items
+**          NOTE: Ownership of the string passes to the caller upon return
+**
+**************************************************************************/
+char *STR_VECTOR_ToSortedList(str_vector_t *sv)
+{
+    if (sv->num_entries == 0)
+    {
+        return NULL;
+    }
+
+    STR_VECTOR_Sort(sv);
+    return STR_VECTOR_ToList(sv);
+}
+
+/*********************************************************************//**
+**
+** STR_VECTOR_ToList
+**
+** Converts a string vector into a dynamically allocated string containing a comma separated list of the items
+**
+** \param   sv - pointer to string vector source structure to convert
+**
+** \return  Dynamically allocated string containing comma separated list of all items in the string vector
+**          NOTE: Ownership of the string passes to the caller upon return
+**
+**************************************************************************/
+char *STR_VECTOR_ToList(str_vector_t *sv)
+{
+    int i;
+    int len;
+    char *buf;
+    char *item;
+    char *p;
+
+    // Iterate over all items, calculating the size of string to allocate
+    len = 0;
+    for (i=0; i < sv->num_entries; i++)
+    {
+        // Account for comma+space separator
+        if (i > 0)
+        {
+            len += 2;
+        }
+
+        len += strlen(sv->vector[i]);
+    }
+    len++;   // Plus 1 to include trailing nul terminator
+
+    // Allocate a string buffer in which to copy the items
+    buf = USP_MALLOC(len);
+
+    // Iterate over all items, adding them to the buffer
+    p = buf;
+    for (i=0; i < sv->num_entries; i++)
+    {
+        // Add comma+space separator
+        if (i > 0)
+        {
+            *p++ = ',';
+            *p++ = ' ';
+        }
+
+        // Copy the item into the string buffer
+        item = sv->vector[i];
+        len = strlen(item);
+        memcpy(p, item, len);
+        p += len;
+    }
+
+    // Add nul terminator
+    *p++ = '\0';
+
+    return buf;
 }
 
 /*********************************************************************//**

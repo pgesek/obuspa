@@ -23,6 +23,7 @@ SOURCES = src/core/main.c \
                     src/core/stomp.c \
                     src/core/socket_set.c \
                     src/core/msg_handler.c \
+                    src/core/msg_utils.c \
                     src/core/handle_get.c \
                     src/core/handle_set.c \
                     src/core/handle_add.c \
@@ -34,6 +35,8 @@ SOURCES = src/core/main.c \
                     src/core/handle_get_supported_dm.c \
                     src/core/group_get_vector.c \
                     src/core/group_set_vector.c \
+                    src/core/group_add_vector.c \
+                    src/core/group_del_vector.c \
                     src/core/proto_trace.c \
                     src/core/data_model.c \
                     src/core/error_resp.c \
@@ -85,10 +88,21 @@ SOURCES = src/core/main.c \
                     src/core/coap_server.c \
                     src/core/uri.c \
                     src/core/mqtt.c \
-                    src/core/device_mqtt.c
+                    src/core/device_mqtt.c \
+                    src/core/wsclient.c \
+                    src/core/wsserver.c \
+                    src/core/usp_record.c \
+                    src/core/sar_vector.c \
+                    src/core/e2e_context.c \
+                    src/core/plugin.c \
+                    src/core/device_uds.c \
+                    src/core/uds.c \
+                    src/core/usp_service.c \
+                    src/core/usp_broker.c
+
 
 obuspa_SOURCES = $(SOURCES)
-obuspa_CPPFLAGS = $(openssl_CFLAGS) $(sqlite3_CFLAGS) $(libcurl_CFLAGS) $(zlib_CFLAGS) $(libmosquitto_CFLAGS)
+obuspa_CPPFLAGS = $(openssl_CFLAGS) $(sqlite3_CFLAGS) $(libcurl_CFLAGS) $(zlib_CFLAGS) $(libmosquitto_CFLAGS) $(libwebsockets_CFLAGS)
 obuspa_CPPFLAGS += -DOBUSPA_LOCAL_STATE_DIR=\"$(OBUSPA_LOCAL_STATE_DIR)\"
 obuspa_CPPFLAGS +=  $(AM_CPPFLAGS) \
                       -Werror \
@@ -103,7 +117,7 @@ obuspa_CPPFLAGS +=  $(AM_CPPFLAGS) \
 obuspa_LDFLAGS = -rdynamic
 
 obuspa_LDADD = -lm -ldl -lpthread -lrt
-obuspa_LDADD += $(openssl_LIBS) $(sqlite3_LIBS) $(libcurl_LIBS) $(zlib_LIBS) $(libmosquitto_LIBS)
+obuspa_LDADD += $(openssl_LIBS) $(sqlite3_LIBS) $(libcurl_LIBS) $(zlib_LIBS) $(libmosquitto_LIBS) $(libwebsockets_LIBS)
 
 obuspa_LDFLAGS += -Wl,-rpath=/usr/local/lib
 
@@ -121,4 +135,3 @@ uninstall-local:
 
 # Import vendor makefile
 include src/vendor/vendor.am
-

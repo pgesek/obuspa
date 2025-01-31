@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019, Broadband Forum
- * Copyright (C) 2016-2019  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -42,6 +42,10 @@
 #define SUBS_RETRY_H
 
 #include "usp-msg.pb-c.h"
+
+// OnBoardRequests do not have an associated entry in the subscription table
+// Reserve this special case instance number for use with SUBS_RETRY_Add()
+#define ON_BOARD_REQUEST_SUBS_INSTANCE 0
 
 void SUBS_RETRY_Init(void);
 void SUBS_RETRY_Stop(void);

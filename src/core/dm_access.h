@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019, Broadband Forum
- * Copyright (C) 2016-2019  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -41,6 +41,7 @@
 #ifndef DM_ACCESS_H
 #define DM_ACCESS_H
 
+#include "vendor_defs.h"  // For REMOVE_DEVICE_SECURITY
 #include <time.h>
 #include "str_vector.h"
 #include "nu_ipaddr.h"
@@ -78,6 +79,9 @@ int DM_ACCESS_RestartAsyncOperation(dm_req_t *req, int instance, bool *is_restar
 int DM_ACCESS_DontRestartAsyncOperation(dm_req_t *req, int instance, bool *is_restart, int *err_code, char *err_msg, int err_msg_len, kv_vector_t *output_args);
 int DM_ACCESS_PopulateAliasParam(dm_req_t *req, char *buf, int len);
 
+#ifndef REMOVE_DEVICE_SECURITY
+int DM_ACCESS_ValidateBase64(dm_req_t *req, char *value);
+#endif
 
 
 #endif

@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2021, Broadband Forum
- * Copyright (C) 2017-2021  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2017-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -39,11 +39,13 @@
  *
  */
 
+#ifndef REMOVE_DEVICE_BULKDATA
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
 #include <zlib.h>
+#include <curl/curl.h>
 
 #include "common_defs.h"
 #include "data_model.h"
@@ -59,6 +61,7 @@
 #include "bdc_exec.h"
 #include "dm_exec.h"
 #include "group_get_vector.h"
+#include "usp_broker.h"
 
 //------------------------------------------------------------------------------
 // String versions of defines in vendor_defs.h
@@ -120,13 +123,15 @@ static bulkdata_profile_t bulkdata_profiles[BULKDATA_MAX_PROFILES];
 // Bulk Data Collection Protocol
 #define BULKDATA_PROTOCOL_HTTP "HTTP"
 #define BULKDATA_PROTOCOL_USP_EVENT "USPEventNotif"
-#define BULKDATA_PROTOCOL  BULKDATA_PROTOCOL_HTTP "," BULKDATA_PROTOCOL_USP_EVENT
+#define BULKDATA_PROTOCOL_MQTT "MQTT"
 
 typedef enum
 {
     kBdcProtocol_HTTP,
     kBdcProtocol_UspEvent,
-
+#ifdef ENABLE_MQTT
+    kBdcProtocol_MQTT,
+#endif
     kBdcProtocol_Max               // This should always be the last value in this enumeration. It is used to statically size arrays based on one entry for each active enumeration
 } bdc_protocol_t;
 
@@ -135,6 +140,9 @@ const enum_entry_t bdc_protocols[kBdcProtocol_Max] =
 {
     { kBdcProtocol_HTTP,               BULKDATA_PROTOCOL_HTTP },       // This is the default value for notification type
     { kBdcProtocol_UspEvent,           BULKDATA_PROTOCOL_USP_EVENT },
+#ifdef ENABLE_MQTT
+    { kBdcProtocol_MQTT,               BULKDATA_PROTOCOL_MQTT },
+#endif
 };
 
 //---------------------------------------------------------------------------------------------
@@ -153,6 +161,10 @@ static char *profile_push_event_args[] =
 typedef struct
 {
     int num_retained_failed_reports;
+#ifdef ENABLE_MQTT
+    char mqtt_reference[254];      // relates to Device.BulkData.Profile.{i}.MQTT.Reference
+    char mqtt_publish_topic[254];  // relates to Device.BulkData.Profile.{i}.MQTT.PublishTopic
+#endif
     char report_timestamp[33];
     char url[1025];
     char username[257];
@@ -249,6 +261,11 @@ char *bulkdata_platform_calc_uri_query_string(kv_vector_t *escaped_map);
 int bulkdata_platform_get_param_refs(int profile_id, param_ref_vector_t *param_refs);
 void bulkdata_expand_param_ref(param_ref_entry_t *pr, group_get_vector_t *ggv);
 void bulkdata_append_to_result_map(param_ref_entry_t *pr, group_get_vector_t *ggv, kv_vector_t *report_map);
+#ifdef ENABLE_MQTT
+int Validate_BulkDataMqttReference(dm_req_t *req, char *value);
+void bulkdata_process_profile_mqtt(bulkdata_profile_t *bp);
+int bulkdata_schedule_sending_mqtt_report(profile_ctrl_params_t *ctrl, bulkdata_profile_t *bp, char *json_report, int report_len);
+#endif
 
 /*********************************************************************//**
 **
@@ -280,7 +297,7 @@ int DEVICE_BULKDATA_Init(void)
     err = USP_REGISTER_DBParam_ReadWrite("Device.BulkData.Enable", "false", NULL, NotifyChange_BulkDataGlobalEnable, DM_BOOL);
     err |= USP_REGISTER_VendorParam_ReadOnly("Device.BulkData.Status", Get_BulkDataGlobalStatus, DM_STRING);
     err |= USP_REGISTER_Param_Constant("Device.BulkData.MinReportingInterval", BULKDATA_MINIMUM_REPORTING_INTERVAL_STR, DM_UINT);
-    err |= USP_REGISTER_Param_Constant("Device.BulkData.Protocols", BULKDATA_PROTOCOL, DM_STRING);
+    err |= USP_REGISTER_Param_SupportedList("Device.BulkData.Protocols", bdc_protocols, NUM_ELEM(bdc_protocols));
     err |= USP_REGISTER_Param_Constant("Device.BulkData.EncodingTypes", BULKDATA_ENCODING_TYPE, DM_STRING);
     err |= USP_REGISTER_Param_Constant("Device.BulkData.ParameterWildCardSupported", "true", DM_BOOL);
     err |= USP_REGISTER_Param_Constant("Device.BulkData.MaxNumberOfProfiles", BULKDATA_MAX_PROFILES_STR, DM_INT);
@@ -330,6 +347,12 @@ int DEVICE_BULKDATA_Init(void)
     err |= USP_REGISTER_Param_NumEntries("Device.BulkData.Profile.{i}.HTTP.RequestURIParameterNumberOfEntries", "Device.BulkData.Profile.{i}.HTTP.RequestURIParameter.{i}");
     err |= USP_REGISTER_DBParam_ReadWrite("Device.BulkData.Profile.{i}.HTTP.RequestURIParameter.{i}.Name", "", NULL, NULL, DM_STRING);
     err |= USP_REGISTER_DBParam_ReadWrite("Device.BulkData.Profile.{i}.HTTP.RequestURIParameter.{i}.Reference", "", Validate_BulkDataReference, NULL, DM_STRING);
+
+#ifdef ENABLE_MQTT
+    // Device.BulkData.Profile.{i}.MQTT
+    err |= USP_REGISTER_DBParam_ReadWrite("Device.BulkData.Profile.{i}.MQTT.Reference", "", Validate_BulkDataMqttReference, NULL, DM_STRING);
+    err |= USP_REGISTER_DBParam_ReadWrite("Device.BulkData.Profile.{i}.MQTT.PublishTopic", "", NULL, NULL, DM_STRING);
+#endif
 
     // Register Push! Event
     err |= USP_REGISTER_Event(BULKDATA_PROFILE_PUSH_EVENT);
@@ -465,6 +488,7 @@ void DEVICE_BULKDATA_NotifyTransferResult(int profile_id, bdc_transfer_result_t 
     {
         // Report(s) have been successfully sent, so don't retain them
         bulkdata_clear_retained_reports(bp);
+        bp->is_working = true;
     }
     else
     {
@@ -474,6 +498,7 @@ void DEVICE_BULKDATA_NotifyTransferResult(int profile_id, bdc_transfer_result_t 
             // Report(s) have not been sent successfully, so start the retry mechanism (or increment the retry_count, if it is already in progress)
             bp->retry_count++;
         }
+        bp->is_working = false;
     }
 
 
@@ -561,13 +586,13 @@ int Validate_NumberOfRetainedFailedReports(dm_req_t *req, char *value)
 **************************************************************************/
 int Validate_BulkDataProtocol(dm_req_t *req, char *value)
 {
-    int err;
     bdc_protocol_t protocol;
 
-    err = DM_ACCESS_GetEnum(req->path, &protocol, bdc_protocols, NUM_ELEM(bdc_protocols));
-    if (err != USP_ERR_OK)
+    protocol = TEXT_UTILS_StringToEnum(value, bdc_protocols, NUM_ELEM(bdc_protocols));
+    if (protocol == INVALID)
     {
-        return err;
+        USP_ERR_SetMessage("%s: Invalid or unsupported protocol (%s)", __FUNCTION__, value);
+        return USP_ERR_INVALID_VALUE;
     }
 
     return USP_ERR_OK;
@@ -628,21 +653,55 @@ int Validate_BulkDataReportingInterval(dm_req_t *req, char *value)
 **************************************************************************/
 int Validate_BulkDataReference(dm_req_t *req, char *value)
 {
+    // Exit if path is not a valid reference
+    // NOTE: TR157 Bulk Data Collection only allows partial paths and wildcards
+    // However for USP we also allow search expressions. We do not allow reference following
+    // (because the alt-name reduction rules in TR-157 do not support it)
+
+#ifdef USE_LEGACY_PATH_VALIDATION
     int err;
     combined_role_t combined_role;
 
-    // Exit if path is not a valid reference
-    // NOTE: TR157 Bulk Data Collection only allows partial paths and wildcards
     // NOTE: The resolved paths are validated against the current controller's role.
     // So even if a partial path is specified here, it will fail to validate if permissions do not allow it
     MSG_HANDLER_GetMsgRole(&combined_role);
-    err = PATH_RESOLVER_ResolveDevicePath(value, NULL, NULL, kResolveOp_GetBulkData, NULL, &combined_role, 0);
-    if (err != USP_ERR_OK)
+    err = PATH_RESOLVER_ResolveDevicePath(value, NULL, NULL, kResolveOp_GetBulkData, FULL_DEPTH, &combined_role, 0);
+    return err;
+
+#else
+    // When running as a USP Broker, the DM elements referenced by the path might not have been registered yet
+    // So since we cannot resolve the path, instead try to verify it textually
+    int err;
+    char *p;
+    bool inside_brackets;
+
+    // Exit if the path contained a reference follow (outside of a unique key search expression)
+    // Reference following is not allowed for BulkData because the alt-name reduction rules in TR-157 do not support it
+    inside_brackets = false;
+    p = value;
+    while (*p != '\0')
     {
-        return err;
+        if (*p == '[')
+        {
+            inside_brackets = true;
+        }
+        else if (*p == ']')
+        {
+            inside_brackets = false;
+        }
+        else if ((*p == '+') && (inside_brackets == false))
+        {
+            USP_ERR_SetMessage("%s: Bulk Data collection does not allow reference following in search expressions", __FUNCTION__);
+            return USP_ERR_INVALID_PATH_SYNTAX;
+        }
+        p++;
     }
 
-    return USP_ERR_OK;
+    err = PATH_RESOLVER_ValidatePath(value, kSubNotifyType_ValueChange);
+
+    return err;
+
+#endif
 }
 
 /*********************************************************************//**
@@ -777,6 +836,37 @@ int Validate_BulkDataRetryIntervalMultiplier(dm_req_t *req, char *value)
 {
     return DM_ACCESS_ValidateRange_Unsigned(req, 1000, 65535);
 }
+
+#ifdef ENABLE_MQTT
+/*********************************************************************//**
+**
+** Validate_BulkDataMqttReference
+**
+** Validates Device.BulkData.Profile.*.MQTT.Reference
+** by checking that it refers to a valid reference in the Device.MQTT.Client table
+**
+** \param   req - pointer to structure identifying the parameter
+** \param   value - value that the controller would like to set the parameter to
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int Validate_BulkDataMqttReference(dm_req_t *req, char *value)
+{
+    int err;
+    int mqtt_connection_instance;
+
+    // Exit if the MQTT Reference refers to nothing. This can occur if a MQTT client being referred to is deleted.
+    if (*value == '\0')
+    {
+        return USP_ERR_OK;
+    }
+
+    err = DM_ACCESS_ValidateReference(value, "Device.MQTT.Client.{i}", &mqtt_connection_instance);
+
+    return err;
+}
+#endif
 
 /*********************************************************************//**
 **
@@ -1779,7 +1869,7 @@ exit:
 **
 ** bulkdata_expand_param_ref
 **
-** Expands the specified parameter reference, storing all the parameters it refrences into the get group vector
+** Expands the specified parameter reference, storing all the parameters it references into the get group vector
 **
 ** \param   pr - pointer to parameter reference to expand
 ** \param   ggv - pointer to vector to add params found in this path expression to
@@ -1792,16 +1882,13 @@ void bulkdata_expand_param_ref(param_ref_entry_t *pr, group_get_vector_t *ggv)
     int err;
     str_vector_t params;
     int_vector_t group_ids;
-    combined_role_t combined_role;
 
     STR_VECTOR_Init(&params);
     INT_VECTOR_Init(&group_ids);
 
     // Exit if unable to get the resolved paths
-    // NOTE: We can safely use the FullAccess role here, because we have already validated the path expression against the controller's role
-    combined_role.inherited = kCTrustRole_FullAccess;
-    combined_role.assigned = kCTrustRole_FullAccess;
-    err = PATH_RESOLVER_ResolveDevicePath(pr->path_expr, &params, &group_ids, kResolveOp_GetBulkData, NULL, &combined_role, 0);
+    // NOTE: This uses the full access role because the Bulk Data Collector is not a Controller and hence not subject to ControllerTrust permissions
+    err = PATH_RESOLVER_ResolveDevicePath(pr->path_expr, &params, &group_ids, kResolveOp_GetBulkData, FULL_DEPTH, INTERNAL_ROLE, DONT_LOG_RESOLVER_ERRORS);
     if (err != USP_ERR_OK)
     {
         STR_VECTOR_Destroy(&params);
@@ -1933,14 +2020,6 @@ int bulkdata_platform_get_profile_control_params(bulkdata_profile_t *bp, profile
         return err;
     }
 
-    // Exit if URL has not been setup by the ACS
-    if (ctrl_params->url[0] == '\0')
-    {
-        USP_LOG_Error("%s: Profile %d started but it's URL has not been setup", __FUNCTION__, bp->profile_id);
-        bp->is_working = false;
-        return err;
-    }
-
     // Exit if unable to get Username
     USP_SNPRINTF(path, sizeof(path), "Device.BulkData.Profile.%d.HTTP.Username", bp->profile_id);
     err = DATA_MODEL_GetParameterValue(path, ctrl_params->username, sizeof(ctrl_params->username), 0);
@@ -1981,6 +2060,38 @@ int bulkdata_platform_get_profile_control_params(bulkdata_profile_t *bp, profile
         return err;
     }
 
+#ifdef ENABLE_MQTT
+{
+    char protocol[32];
+
+    // Exit if unable to get BDC Protocol
+    USP_SNPRINTF(path, sizeof(path), "Device.BulkData.Profile.%d.Protocol", bp->profile_id);
+    err = DATA_MODEL_GetParameterValue(path, protocol, sizeof(protocol), 0);
+    if (err != USP_ERR_OK)
+    {
+        return err;
+    }
+
+    // If Protocol is MQTT then get MQTT specific parameters
+    if (strcmp(protocol, BULKDATA_PROTOCOL_MQTT)==0)
+    {
+        USP_SNPRINTF(path, sizeof(path), "Device.BulkData.Profile.%d.MQTT.Reference", bp->profile_id);
+        err = DATA_MODEL_GetParameterValue(path, ctrl_params->mqtt_reference, sizeof(ctrl_params->mqtt_reference), 0);
+        if (err != USP_ERR_OK)
+        {
+            return err;
+        }
+
+        USP_SNPRINTF(path, sizeof(path), "Device.BulkData.Profile.%d.MQTT.PublishTopic", bp->profile_id);
+        err = DATA_MODEL_GetParameterValue(path, ctrl_params->mqtt_publish_topic, sizeof(ctrl_params->mqtt_publish_topic), 0);
+        if (err != USP_ERR_OK)
+        {
+            return err;
+        }
+    }
+}
+#endif
+
     return USP_ERR_OK;
 }
 
@@ -1999,15 +2110,7 @@ int bulkdata_start_profile(bulkdata_profile_t *bp)
 {
     int err;
     int wait_time;
-    profile_ctrl_params_t ctrl;
 
-
-    // Exit if unable to obtain the control parameters for this profile
-    err = bulkdata_platform_get_profile_control_params(bp, &ctrl);
-    if (err != USP_ERR_OK)
-    {
-        return err;
-    }
 
     // Determine the time until the timer should next fire
     wait_time = bulkdata_calc_waittime_to_next_reporting_interval(bp->reporting_interval, bp->time_reference);
@@ -2205,6 +2308,11 @@ void bulkdata_process_profile(int id)
             bulkdata_process_profile_usp_event(bp);
             break;
 
+#ifdef ENABLE_MQTT
+        case kBdcProtocol_MQTT:
+            bulkdata_process_profile_mqtt(bp);
+            break;
+#endif
         default:
             break;
     }
@@ -2276,7 +2384,7 @@ void bulkdata_process_profile_http(bulkdata_profile_t *bp)
     USP_LOG_Info("BULK DATA: using compression method=%s", ctrl.compression);
     if (enable_protocol_trace)
     {
-        USP_LOG_String(kLogType_Protocol, json_report);
+        USP_LOG_String(kLogLevel_Info, kLogType_Protocol, json_report);
     }
 
     // Compress the report, if enabled
@@ -2386,6 +2494,86 @@ exit:
 //    USP_MEM_PrintSummary();
 }
 
+#ifdef ENABLE_MQTT
+/*********************************************************************//**
+**
+**  bulkdata_process_profile_mqtt
+**
+**  Perform the work of processing a profile
+**
+** \param   bp - pointer to bulk data profile to process
+**
+** \return  None
+**
+**************************************************************************/
+void bulkdata_process_profile_mqtt(bulkdata_profile_t *bp)
+{
+    int err;
+    report_t *cur_report;
+    char *report;
+    profile_ctrl_params_t ctrl;
+    char buf[48];
+
+    // Exit if unable to obtain the control parameters for this profile
+    err = bulkdata_platform_get_profile_control_params(bp, &ctrl);
+    if (err != USP_ERR_OK)
+    {
+        return;
+    }
+
+    // If we are not retrying to send a failed report(s) then append the report map for this reporting interval
+    if (bp->retry_count == 0)
+    {
+        // Drop the oldest retained reports, if we would store more than we're meant to
+        if (bp->num_retained_reports > ctrl.num_retained_failed_reports)
+        {
+            bulkdata_drop_oldest_retained_reports(bp, ctrl.num_retained_failed_reports);
+        }
+
+        // Append the report map for this reporting interval
+        cur_report = &bp->reports[bp->num_retained_reports];
+        cur_report->collection_time = time(NULL);
+
+        KV_VECTOR_Init(&cur_report->report_map);
+
+        // Exit if unable to get the map containing the report contents
+        err = bulkdata_calc_report_map(bp, &cur_report->report_map);
+        if (err != USP_ERR_OK)
+        {
+            USP_ERR_SetMessage("%s: bulkdata_calc_report_map failed", __FUNCTION__);
+            return;
+        }
+        bp->num_retained_reports++;
+    }
+
+    // Exit if unable to generate the report
+    report = bulkdata_generate_json_report(bp, ctrl.report_timestamp);
+    if (report == NULL)
+    {
+	    USP_ERR_SetMessage("%s: bulkdata_generate_json_report failed", __FUNCTION__);
+	    return;
+    }
+
+    // Print out the JSON report, if debugging is enabled
+    USP_LOG_Debug("\nBULK DATA: %sing at time %s, to url=%s", ctrl.method, iso8601_cur_time(buf, sizeof(buf)), ctrl.url);
+    if (enable_protocol_trace)
+    {
+        USP_LOG_String(kLogLevel_Info, kLogType_Protocol, report);
+    }
+
+    // Exit if failed to tell BDC thread to send the report
+    err = bulkdata_schedule_sending_mqtt_report(&ctrl, bp, report, strlen(report));
+    if (err != USP_ERR_OK)
+    {
+        DEVICE_BULKDATA_NotifyTransferResult(bp->profile_id, kBDCTransferResult_Failure_Other);
+    }
+    else
+    {
+        DEVICE_BULKDATA_NotifyTransferResult(bp->profile_id, kBDCTransferResult_Success);
+    }
+}
+#endif
+
 /*********************************************************************//**
 **
 **  bulkdata_drop_oldest_retained_reports
@@ -2456,8 +2644,8 @@ void bulkdata_clear_retained_reports(bulkdata_profile_t *bp)
 ** \param   spec - path specification (This may be a partial path, or contain wildcards, and one of it's expansions was 'path')
 ** \param   path - fully expanded data model path
 ** \param   alt_name - alternative name for the above path
-** \param   reduced_path - pointer to buffer in which to return the reduced name
-** \param   len - size of buffer in which to return the reduced name
+** \param   out_buf - pointer to buffer in which to return the reduced name
+** \param   buf_len - size of buffer in which to return the reduced name
 **
 ** \return  USP_ERR_OK if successful
 **
@@ -2467,6 +2655,9 @@ int bulkdata_reduce_to_alt_name(char *spec, char *path, char *alt_name, char *ou
     char *s;    // pointer stepping thru spec
     char *p;    // pointer stepping thru path
     char *o;    // pointer stepping thru out_buf
+    char *t;    // temp pointer
+
+    memset(out_buf, 0, buf_len);
 
     // Exit if no alt_name - no reduction necessary
     if (*alt_name == '\0')
@@ -2508,9 +2699,26 @@ int bulkdata_reduce_to_alt_name(char *spec, char *path, char *alt_name, char *ou
             {
                 // Copy index characters at wildcard
                 *o++ = *p++;
-                if (*p == '.')
+                if (*p == '.')  // Only move off the wildcard character when we have copied all of the index characters
                 {
-                    s++;    // Only move off the wildcard character when we have copied all of the index characters
+                    s++;
+                    *o++ = '.';
+                }
+            }
+            else if (*s == '[')
+            {
+                // Copy index characters at search expression
+                *o++ = *p++;
+                if (*p == '.')  // Only move after the search expression when we have copied all of the index characters
+                {
+                    // Find the end of the unique key
+                    // NOTE: We should always find the end of the unique key, as the code shouldn't be performing alt name reduction unless the path expression is valid
+                    t = strchr(s, ']');
+                    if (t != NULL)
+                    {
+                        s = t;
+                    }
+                    s++;
                     *o++ = '.';
                 }
             }
@@ -2540,48 +2748,6 @@ int bulkdata_reduce_to_alt_name(char *spec, char *path, char *alt_name, char *ou
     return USP_ERR_OK;
 }
 
-#if 0
-//--------------------------------------------------------------------------
-// Test code
-
-//int test_reduce(void)
-//{
-//    char buf[100];
-//
-//    // fully qualified
-//    bulkdata_reduce_to_alt_name("Device.Stuff.Hello",
-//                                "Device.Stuff.Hello",
-//                                "alt", buf);
-//
-//    // partial path
-//    bulkdata_reduce_to_alt_name("Device.Stuff.Hello.",
-//                                "Device.Stuff.Hello.This.Should.Be.1.Addded",
-//                                "alt", buf);
-//
-//    // partial path, no trailing '.' in spec
-//    bulkdata_reduce_to_alt_name("Device.Stuff.Hello",
-//                                "Device.Stuff.Hello.This.Should.Be.2.Addded",
-//                                "alt", buf);
-//
-//    // wildcard
-//    bulkdata_reduce_to_alt_name("Device.*.Stuff.*.Hello",
-//                                "Device.56.Stuff.72.Hello",
-//                                "alt", buf);
-//
-//    // wildcard with partial path
-//    bulkdata_reduce_to_alt_name("Device.*.Stuff.*.Hello.",
-//                                "Device.56.Stuff.72.Hello.This.Should.Be.3.Addded",
-//                                "alt", buf);
-//
-//    // wildcard with partial path, no trailing '.' in spec
-//    bulkdata_reduce_to_alt_name("Device.*.Stuff.*.Hello",
-//                                "Device.56.Stuff.72.Hello.This.Should.Be.4.Addded",
-//                                "alt", buf);
-//
-//    return 0;
-//}
-#endif
-
 /*********************************************************************//**
 **
 **  bulkdata_generate_json_report
@@ -2608,6 +2774,8 @@ char *bulkdata_generate_json_report(bulkdata_profile_t *bp, char *report_timesta
     kv_vector_t *report_map;
     report_t *report;
     double value_as_number;
+    long long value_as_ll;
+    unsigned long long value_as_ull;
     bool value_as_bool;
     char *result;
     int i, j;
@@ -2652,6 +2820,16 @@ char *bulkdata_generate_json_report(bulkdata_profile_t *bp, char *report_timesta
             {
                 case 'S':
                     json_append_member(element, param_path, json_mkstring(param_value) );
+                    break;
+
+                case 'U':
+                    value_as_ull = strtoull(param_value, NULL, 10);
+                    json_append_member(element, kv->key, json_mkulonglong(value_as_ull) );
+                    break;
+
+                case 'L':
+                    value_as_ll = strtoll(param_value, NULL, 10);
+                    json_append_member(element, kv->key, json_mklonglong(value_as_ll) );
                     break;
 
                 case 'N':
@@ -2776,6 +2954,56 @@ unsigned char *bulkdata_compress_report(profile_ctrl_params_t *ctrl, char *input
     return output_buf;
 }
 
+#ifdef ENABLE_MQTT
+/*********************************************************************//**
+**
+**  bulkdata_schedule_sending_mqtt_report
+**
+**  Tells the BDC thread to send the report
+**  NOTE: Ownership of report passes to BDC_EXEC or is freed by this function if unable to send the report
+**
+** \param   ctrl - parameters controlling the profile e.g. URL to upload report to
+** \param   bp - pointer to bulk data profile to get the report map for
+** \param   report - pointer to buffer containing the report to send (which may be compressed)
+** \param   report_len - length of json_report
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int bulkdata_schedule_sending_mqtt_report(profile_ctrl_params_t *ctrl, bulkdata_profile_t *bp, char *report, int report_len)
+{
+    mtp_send_item_t mtp_send_item;
+    int mqtt_client_instance = 0;
+    int err;
+
+    // Exit if the MQTT client instance does not exist
+    err = DM_ACCESS_ValidateReference(ctrl->mqtt_reference, "Device.MQTT.Client.{i}", &mqtt_client_instance);
+    if (err != USP_ERR_OK)
+    {
+        USP_LOG_Error("%s: Unable to send report as invalid MQTT client reference (%s)", __FUNCTION__, ctrl->mqtt_reference);
+        USP_FREE(report);
+        return err;
+    }
+
+    // Prepare the MTP item information now it is serialized.
+    MTP_EXEC_MtpSendItem_Init(&mtp_send_item);
+    mtp_send_item.usp_msg_type = USP__HEADER__MSG_TYPE__ERROR;  // This is actually don't care for the content_type
+    mtp_send_item.content_type = kMtpContentType_BulkDataReport;
+    mtp_send_item.pbuf = (uint8_t *)report;  // Ownership of the serialized USP Record passes to the queue, unless an error is returned.
+    mtp_send_item.pbuf_len = report_len;
+
+    // Exit if unable to queue the message. This could occur if the MQTT Client is not enabled
+    err = MQTT_QueueBinaryMessage(&mtp_send_item, mqtt_client_instance, ctrl->mqtt_publish_topic, END_OF_TIME);
+    if (err != USP_ERR_OK)
+    {
+        USP_FREE(report);
+        return err;
+    }
+
+    return USP_ERR_OK;
+}
+#endif
+
 /*********************************************************************//**
 **
 **  bulkdata_schedule_sending_http_report
@@ -2799,6 +3027,13 @@ int bulkdata_schedule_sending_http_report(profile_ctrl_params_t *ctrl, bulkdata_
     int err;
     char *username;
     char *password;
+
+    // Exit if URL is empty
+    if (ctrl->url[0] == '\0')
+    {
+        USP_LOG_Error("%s: Profile %d started but it's URL has not been setup", __FUNCTION__, bp->profile_id);
+        return USP_ERR_INVALID_ARGUMENTS;
+    }
 
     // Exit if unable to generate the URI query string
     query_string = bulkdata_platform_get_uri_query_params(bp->profile_id);
@@ -2906,3 +3141,70 @@ bulkdata_profile_t *bulkdata_find_profile(int profile_id)
     return NULL;
 }
 
+//------------------------------------------------------------------------------------------
+// Code to test the bulkdata_reduce_to_alt_name() function
+#if 0
+char *reduce_to_alt_test_cases[] =
+{
+    // Path Expression                      // Resolved path                        // Expected Result
+
+    // fully qualified
+    "Device.Stuff.Hello",                   "Device.Stuff.Hello",                   "alt",
+
+    // partial path
+    "Device.Stuff.Hello.",                  "Device.Stuff.Hello.Obj.1.Param",       "alt.Obj.1.Param",
+
+    // partial path, no trailing '.' in expression
+    "Device.Stuff.Hello",                   "Device.Stuff.Hello.Obj.2.Param",       "alt.Obj.2.Param",
+
+    //------------------------
+    // basic wildcard
+    "Device.1.Stuff.*.Hello",               "Device.1.Stuff.72.Hello",              "alt.72",
+
+    // wildcard with partial path
+    "Device.*.ObjA.",                       "Device.56.ObjA.ObjB.7.Param",          "alt.56.ObjB.7.Param",
+
+    // 2 wildcards
+    "Device.*.Stuff.*.Hello",               "Device.56.Stuff.72.Hello",             "alt.56.72",
+
+    // 2 wildcards with partial path
+    "Device.*.Stuff.*.Hello.",              "Device.56.Stuff.72.Hello.Obj.3.Param", "alt.56.72.Obj.3.Param",
+
+    // wildcard with partial path, but path expression does not contain a trailing '.'
+    "Device.*.Stuff.*.Hello",               "Device.56.Stuff.72.Hello.Obj.4.Param", "alt.56.72.Obj.4.Param",
+
+    //------------------------
+    // basic search expression
+    "Device.[Param == \"string\"].Param",   "Device.56.Param",                      "alt.56",
+
+    // search expression with partial path
+    "Device.[Param == \"string\"].ObjA.",   "Device.56.ObjA.ObjB.7.Param",          "alt.56.ObjB.7.Param",
+
+    // 2 search expressions
+    "Device.[A==1].Stuff.[B==2].Hello",     "Device.56.Stuff.72.Hello",             "alt.56.72",
+
+    // 2 search expressions with partial path
+    "Device.[A==1].Stuff.[B==2].Hello.",    "Device.56.Stuff.72.Hello.Obj.3.Param", "alt.56.72.Obj.3.Param",
+
+    // 2 search expressions with partial path, but path expression does not contain a trailing '.'
+    "Device.[A==1].Stuff.[B==2].Hello",     "Device.56.Stuff.72.Hello.Obj.4.Param", "alt.56.72.Obj.4.Param",
+};
+
+void Test_ReduceToAltName(void)
+{
+    int i;
+    int err;
+    char buf[MAX_DM_PATH];
+
+    for (i=0; i < NUM_ELEM(reduce_to_alt_test_cases); i+=3)
+    {
+        err = bulkdata_reduce_to_alt_name(reduce_to_alt_test_cases[i], reduce_to_alt_test_cases[i+1], "alt", buf, sizeof(buf));
+        if ((err != USP_ERR_OK) || (strcmp(buf, reduce_to_alt_test_cases[i+2]) != 0))
+        {
+            printf("ERROR: [%d] Test case result for '%s => %s' is '%s' (expected '%s')\n", i/3, reduce_to_alt_test_cases[i], reduce_to_alt_test_cases[i+1], buf, reduce_to_alt_test_cases[i+2]);
+        }
+    }
+}
+#endif
+
+#endif // REMOVE_DEVICE_BULKDATA

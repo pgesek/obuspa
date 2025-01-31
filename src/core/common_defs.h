@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2021, Broadband Forum
- * Copyright (C) 2016-2021  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -45,6 +45,7 @@
 #include <stddef.h>     // for NULL
 #include <time.h>       // for time_t
 #include <limits.h>     // for INT_MAX
+#include <string.h>
 #include "vendor_defs.h"
 #include "usp_err.h"
 #include "usp_log.h"
@@ -54,18 +55,19 @@
 #define NUM_ELEM(x) (sizeof((x)) / sizeof((x)[0]))
 
 // Minimum of two values
+#ifndef MIN
 #define MIN(x, y)  ( ((x) <= (y)) ? (x) : (y) )
+#endif
 
 // Maximum of two values
+#ifndef MAX
 #define MAX(x, y)  ( ((x) >= (y)) ? (x) : (y) )
+#endif
 
 // Whether a character is an alphanumeric symbol character
 #define IS_ALPHA(c)  ( ((c >= 'a') && (c <= 'z')) || ((c >= 'A') && (c <= 'Z')) )
 #define IS_NUMERIC(c)  ((c >= '0') && (c <= '9'))
 #define IS_ALPHA_NUMERIC(c)  ( IS_ALPHA(c) || IS_NUMERIC(c) )
-
-// Magic values used to denote invalid
-#define INVALID (-1)
 
 // Safe version of snprintf, that ensures buffer is always zero terminated, and does not overrun
 extern int USP_SNPRINTF(char *dest, size_t size, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
@@ -75,6 +77,9 @@ extern int USP_SNPRINTF(char *dest, size_t size, const char *fmt, ...) __attribu
 
 // Used to make while loops that do not have an outer level exit condition, readable
 #define FOREVER 1
+
+// Define to be used with all flags arguments to functions, if no flag in the bitmask needs to be set
+#define NO_FLAGS 0
 
 //------------------------------------------------------------------------------
 // Common defines for time
@@ -128,6 +133,14 @@ extern int USP_SNPRINTF(char *dest, size_t size, const char *fmt, ...) __attribu
 //-----------------------------------------------------------------------------------------------
 // Global variables set by command line
 extern bool enable_callstack_debug;
+
+#ifndef REMOVE_USP_SERVICE
+// String specified using the '-R' option. Contains the data model paths to register
+extern char *usp_service_objects;
+#define RUNNING_AS_USP_SERVICE() (usp_service_objects != NULL)
+#else
+#define RUNNING_AS_USP_SERVICE() false
+#endif
 
 
 #endif

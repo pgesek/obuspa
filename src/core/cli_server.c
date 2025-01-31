@@ -1,7 +1,7 @@
 /*
  *
- * Copyright (C) 2019-2020, Broadband Forum
- * Copyright (C) 2016-2020  CommScope, Inc
+ * Copyright (C) 2019-2024, Broadband Forum
+ * Copyright (C) 2016-2024  CommScope, Inc
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -46,12 +46,23 @@
 #include <sys/un.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <string.h>
+#include <sqlite3.h>
+#include <zlib.h>
 
+
+#ifdef ENABLE_WEBSOCKETS
+#include <libwebsockets.h>
+#endif
+
+#ifdef ENABLE_MQTT
+#include <mosquitto.h>
+#endif
 
 #include "common_defs.h"
 #include "cli.h"
@@ -65,33 +76,52 @@
 #include "version.h"
 #include "stomp.h"
 #include "group_get_vector.h"
+#include "bdc_exec.h"
 
+#ifndef REMOVE_USP_SERVICE
+#include "usp_service.h"
+#ifdef ENABLE_UDS
+#include "uds.h"
+#endif
+#endif
+
+#ifndef REMOVE_USP_BROKER
+#include "usp_broker.h"
+#endif
+
+#ifndef REMOVE_DEVICE_BULKDATA
+#include <curl/curl.h>
+#endif
 //------------------------------------------------------------------------------
 // Forward declarations. Note these are not static, because we need them in the symbol table for USP_LOG_Callstack() to show them
 void CloseCliServerSock(void);
-void SendCliResponse_InvalidValue(char *arg, char *usage);
-int SplitArgs(char *args, int num_args, char *usage, char **arg1, char **arg2);
-void RemoveSeparators(char *buf);
-int ExecuteCli_Help(char *arg1, char *arg2, char *usage);
-int ExecuteCli_Version(char *arg1, char *arg2, char *usage);
-int ExecuteCli_Get(char *arg1, char *arg2, char *usage);
-int ExecuteCli_Set(char *arg1, char *arg2, char *usage);
-int ExecuteCli_Add(char *arg1, char *arg2, char *usage);
-int ExecuteCli_Del(char *arg1, char *arg2, char *usage);
-int ExecuteCli_Operate(char *arg1, char *arg2, char *usage);
-int ExecuteCli_GetInstances(char *arg1, char *arg2, char *usage);
-int ExecuteCli_Show(char *arg1, char *arg2, char *usage);
-int ExecuteCli_Dump(char *arg1, char *arg2, char *usage);
-int ExecuteCli_Perm(char *arg1, char *arg2, char *usage);
-int ExecuteCli_DbGet(char *param, char *arg2, char *usage);
-int ExecuteCli_DbSet(char *param, char *value, char *usage);
-int ExecuteCli_DbDel(char *param, char *arg2, char *usage);
-int ExecuteCli_Verbose(char *level, char *arg2, char *usage);
-int ExecuteCli_ProtoTrace(char *level, char *arg2, char *usage);
-int ExecuteCli_Stop(char *arg1, char *arg2, char *usage);
+void SendCliResponse_InvalidValue(str_vector_t *args);
+int ExecuteCli_Help(str_vector_t *args);
+int ExecuteCli_Version(str_vector_t *args);
+int ExecuteCli_Get(str_vector_t *args);
+int ExecuteCli_Set(str_vector_t *args);
+int ExecuteCli_Add(str_vector_t *args);
+int ExecuteCli_Del(str_vector_t *args);
+int ExecuteCli_Operate(str_vector_t *args);
+int ExecuteCli_Event(str_vector_t *args);
+int ExecuteCli_GetInstances(str_vector_t *args);
+int ExecuteCli_Show(str_vector_t *args);
+int ExecuteCli_Dump(str_vector_t *args);
+int ExecuteCli_Perm(str_vector_t *args);
+int ExecuteCli_DbGet(str_vector_t *args);
+int ExecuteCli_DbSet(str_vector_t *args);
+int ExecuteCli_DbDel(str_vector_t *args);
+int ExecuteCli_Verbose(str_vector_t *args);
+int ExecuteCli_ProtoTrace(str_vector_t *args);
+int ExecuteCli_Stop(str_vector_t *args);
 char *SplitOffTrailingNumber(char *s);
 int SplitSetExpression(char *expr, char *search_path, int search_path_len, char *param_name, int param_name_len);
 void SendCliResponse(char *fmt, ...);
+
+#ifndef REMOVE_USP_SERVICE
+int ExecuteCli_Register(str_vector_t *args);
+int ExecuteCli_DeRegister(str_vector_t *args);
+#endif
 
 //------------------------------------------------------------------------------
 // Socket listening for CLI connections
@@ -118,33 +148,46 @@ bool dump_to_cli = false;
 typedef struct
 {
     char *name;
-    int num_args;
+    int min_args;
+    int max_args;
     bool run_locally;
-    int (*exec_cmd)(char *arg1, char *arg2, char *usage);
+    int (*exec_cmd)(str_vector_t *args);
     char *usage;
 } cli_cmd_t;
 
 cli_cmd_t cli_commands[] =
 {
-//    Name    NumArgs  RunLocal?  Exec callback     Usage String
-    { "help",    0, RUN_LOCALLY,  ExecuteCli_Help,  "help" },
-    { "version", 0, RUN_LOCALLY,  ExecuteCli_Version, "version" },
-    { "get",     1, RUN_REMOTELY, ExecuteCli_Get,   "get [path-expr]" },
-    { "set",     2, RUN_REMOTELY, ExecuteCli_Set,   "set [path-expr] [value]"},
-    { "add",     1, RUN_REMOTELY, ExecuteCli_Add,   "add [object]"},
-    { "del",     1, RUN_REMOTELY, ExecuteCli_Del,   "del [path-expr]"},
-    { "operate", 1, RUN_REMOTELY, ExecuteCli_Operate,"operate [operation]"},
-    { "instances", 1, RUN_REMOTELY, ExecuteCli_GetInstances,   "instances [path-expr]" },
-    { "show",    1, RUN_LOCALLY,  ExecuteCli_Show,  "show ['datamodel' | 'database' ]"},
-    { "dump",    1, RUN_REMOTELY, ExecuteCli_Dump,  "dump ['memory' | 'mdelta' | 'subscriptions' | 'instances' ]"},
-    { "perm",    1, RUN_REMOTELY, ExecuteCli_Perm,  "perm [parameter or object]"},
-    { "dbget",   1, RUN_LOCALLY,  ExecuteCli_DbGet, "dbget [parameter]"},
-    { "dbset",   2, RUN_LOCALLY,  ExecuteCli_DbSet, "dbset [parameter] [value]"},
-    { "dbdel",   1, RUN_LOCALLY,  ExecuteCli_DbDel, "dbdel [parameter]"},
-    { "verbose", 1, RUN_REMOTELY, ExecuteCli_Verbose, "verbose [level]"},
-    { "prototrace", 1, RUN_REMOTELY, ExecuteCli_ProtoTrace, "prototrace [enable]"},
-    { "stop",    0, RUN_REMOTELY, ExecuteCli_Stop, "stop"},
+//    Name    MinArgs,MaxArgs  RunLocal?  Exec callback     Usage String
+    { "help",      0,0, RUN_LOCALLY,  ExecuteCli_Help,  "help" },
+    { "version",   0,0, RUN_LOCALLY,  ExecuteCli_Version, "version" },
+    { "get",       1,1, RUN_REMOTELY, ExecuteCli_Get,   "get [path-expr]" },
+    { "set",       1,2, RUN_REMOTELY, ExecuteCli_Set,   "set [path-expr] [value]"},
+    { "add",       1,1, RUN_REMOTELY, ExecuteCli_Add,   "add [object]"},
+    { "del",       1,1, RUN_REMOTELY, ExecuteCli_Del,   "del [path-expr]"},
+    { "operate",   1,1, RUN_REMOTELY, ExecuteCli_Operate,"operate [operation]"},
+    { "event",     1,1, RUN_REMOTELY, ExecuteCli_Event, "event [event]"},
+    { "instances", 1,1, RUN_REMOTELY, ExecuteCli_GetInstances,   "instances [path-expr]" },
+    { "show",      1,1, RUN_LOCALLY,  ExecuteCli_Show,  "show [ 'database' ]"},
+    { "dump",      1,1, RUN_REMOTELY, ExecuteCli_Dump,  "dump ['instances' | 'datamodel' | 'memory' | 'mdelta' | 'subscriptions' ]"},
+    { "perm",      1,1, RUN_REMOTELY, ExecuteCli_Perm,  "perm [path]"},
+    { "dbget",     1,1, RUN_LOCALLY,  ExecuteCli_DbGet, "dbget [parameter]"},
+    { "dbset",     1,2, RUN_LOCALLY,  ExecuteCli_DbSet, "dbset [parameter] [value]"},
+    { "dbdel",     1,1, RUN_LOCALLY,  ExecuteCli_DbDel, "dbdel [parameter]"},
+    { "verbose",   1,1, RUN_REMOTELY, ExecuteCli_Verbose, "verbose [level]"},
+    { "prototrace",1,1, RUN_REMOTELY, ExecuteCli_ProtoTrace, "prototrace [enable]"},
+#ifndef REMOVE_USP_SERVICE
+    { "register",  1,1, RUN_REMOTELY, ExecuteCli_Register,  "register [paths]"},
+    { "deregister",0,1, RUN_REMOTELY, ExecuteCli_DeRegister,  "deregister [paths]"},
+#endif
+#ifndef REMOVE_USP_BROKER
+    { "service",   3,4, RUN_REMOTELY, USP_BROKER_ExecuteCli_Service,  "service [endpoint] [command] [path-expr] [optional: value or notify type]"},
+#endif
+    { "stop",    0,0, RUN_REMOTELY, ExecuteCli_Stop, "stop"},
 };
+
+//------------------------------------------------------------------------------
+// Forward declarations. Note these are not static, because we need them in the symbol table for USP_LOG_Callstack() to show them
+cli_cmd_t *FindCliCommand(char *command);
 
 /*********************************************************************//**
 **
@@ -162,20 +205,38 @@ int CLI_SERVER_Init(void)
     int sock;
     int err;
     struct sockaddr_un sa;
-
-    // Exit if unable to remove the unix domain socket from the filing system
-    err = remove(CLI_UNIX_DOMAIN_FILE);
-    if ((err == -1) && (errno != ENOENT))
-    {
-        USP_ERR_ERRNO("remove", errno);
-        return USP_ERR_INTERNAL_ERROR;
-    }
+    mode_t current_mask;
 
     // Exit if unable to create a socket to listen for CLI commands on
     sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock == -1)
     {
         USP_ERR_ERRNO("socket", errno);
+        return USP_ERR_INTERNAL_ERROR;
+    }
+
+    // Fill in sockaddr structure
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    USP_STRNCPY(sa.sun_path, cli_uds_file, sizeof(sa.sun_path));
+
+    // Exit if able to connect the socket to the unix domain file
+    // In this case the CLI server is already running in another process, so don't attempt to start this one
+    err = connect(sock, (struct sockaddr *) &sa, sizeof(struct sockaddr_un));
+    if (err == 0)
+    {
+        USP_LOG_Error("%s: CLI server already running in another process. Aborting", __FUNCTION__);
+        close(sock);
+        return USP_ERR_INTERNAL_ERROR;
+    }
+
+    // Since we have determined that nothing else is providing the CLI server, we're free to create ours
+    // Exit if unable to remove the unix domain socket from the filing system (this is necessary to do, otherwise the bind fails)
+    err = remove(cli_uds_file);
+    if ((err == -1) && (errno != ENOENT))
+    {
+        USP_ERR_ERRNO("remove", errno);
+        USP_LOG_Error("%s: Unable to remove the Unix domain socket file %s", __FUNCTION__, cli_uds_file);
         return USP_ERR_INTERNAL_ERROR;
     }
 
@@ -188,26 +249,27 @@ int CLI_SERVER_Init(void)
         return USP_ERR_INTERNAL_ERROR;
     }
 
-    // Fill in sockaddr structure
-    memset(&sa, 0, sizeof(sa));
-    sa.sun_family = AF_UNIX;
-    USP_STRNCPY(sa.sun_path, CLI_UNIX_DOMAIN_FILE, sizeof(sa.sun_path));
-
     // Exit if unable to bind the socket to the unix domain file
+    // NOTE: Temporarily change file creation permissions so that this process (running as root) creates a socket that can be accessed by non-root users
+    current_mask = umask(0);
     err = bind(sock, (struct sockaddr *) &sa, sizeof(struct sockaddr_un));
     if (err == -1)
     {
         USP_ERR_ERRNO("bind", errno);
+        USP_LOG_Error("%s: Unable to bind to Unix domain socket file %s", __FUNCTION__, cli_uds_file);
         close(sock);
         return USP_ERR_INTERNAL_ERROR;
     }
+    umask(current_mask);
 
     // Exit if unable to set the socket in listening mode
     #define CLI_SERVER_BACKLOG  1
+    USP_LOG_Info("%s: Starting CLI server on %s", __FUNCTION__, cli_uds_file);
     err = listen(sock, CLI_SERVER_BACKLOG);
     if (err == -1)
     {
         USP_ERR_ERRNO("listen", errno);
+        USP_LOG_Error("%s: Unable to listen to Unix domain socket file %s", __FUNCTION__, cli_uds_file);
         close(sock);
         return USP_ERR_INTERNAL_ERROR;
     }
@@ -337,7 +399,7 @@ void CLI_SERVER_ProcessSocketActivity(socket_set_t *set)
 ** \return  None
 **
 **************************************************************************/
-void CLI_SERVER_SendResponse(char *s)
+void CLI_SERVER_SendResponse(const char *s)
 {
     if (dump_to_cli)
     {
@@ -387,64 +449,71 @@ bool CLI_SERVER_IsCmdRunLocally(char *command)
 ** Executes the specified cli command
 ** NOTE: This function alters the input buffer pointed to by args
 **
-** \param   command - string containing the command and it's arguments
+** \param   cmd_line - string containing the command and it's arguments
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int CLI_SERVER_ExecuteCliCommand(char *command)
+int CLI_SERVER_ExecuteCliCommand(char *cmd_line)
 {
-    int i;
     cli_cmd_t *cli_cmd;
-    char *args;
-    char *cmd_end;
-    char *arg1;
-    char *arg2;
-    int err;
+    int err = USP_ERR_INVALID_ARGUMENTS;
+    str_vector_t args;
+    int num_args;
+    bool print_help = true;
+    char separator[2] = {CLI_SEPARATOR , '\0'};
+    char *command;
 
-    // Split string into command and args
-    cmd_end = strchr(command, CLI_SEPARATOR);
-    if (cmd_end != NULL)
+    // Exit if no command found, after extracting command and args from the input string
+    STR_VECTOR_Init(&args);
+    TEXT_UTILS_SplitString(cmd_line, &args, separator);
+    if (args.num_entries == 0)
     {
-        *cmd_end = '\0';
-        args = cmd_end+1;
+        SendCliResponse("ERROR: No command given\n", cmd_line);
+        goto exit;
     }
-    else
+    command = args.vector[0];
+    num_args = args.num_entries-1;      // Since the command is at entry [0] in the args string vector
+
+    // Exit if command not found
+    cli_cmd = FindCliCommand(command);
+    if (cli_cmd == NULL)
     {
-        args = NULL;
-    }
-
-    // Iterate over all possible commands, trying to find the one that matches
-    for (i=0; i<NUM_ELEM(cli_commands); i++)
-    {
-        cli_cmd = &cli_commands[i];
-        if (strcmp(command, cli_cmd->name)==0)
-        {
-            // Decide whether output logs should be redirected to remote CLI client
-            dump_to_cli = (cli_cmd->run_locally) ? false : true;
-
-            // Exit if not enough arguments provided for command (this may need to write to output log)
-            err = SplitArgs(args, cli_cmd->num_args, cli_cmd->usage, &arg1, &arg2);
-            if (err != USP_ERR_OK)
-            {
-                dump_to_cli = false;
-                return err;
-            }
-
-            // Process command
-            err = cli_cmd->exec_cmd(arg1, arg2, cli_cmd->usage);
-            dump_to_cli = false;
-            return err;
-        }
+        SendCliResponse("ERROR: Unknown command: %s\n", command);
+        goto exit;
     }
 
-    // If the code gets here, then the command was not found
-    // The code should only get here on the CLI client, as unknown commands are always
-    // passed to the client by CLI_SERVER_IsCmdRunLocally()
-    SendCliResponse("ERROR: Unknown command: %s\n", command);
-    ExecuteCli_Help(NULL, NULL, NULL);
+    // Decide whether output logs should be redirected to remote CLI client
+    dump_to_cli = (cli_cmd->run_locally) ? false : true;
 
-    return USP_ERR_INVALID_ARGUMENTS;
+    // Exit if not enough arguments provided for command
+    if (num_args < cli_cmd->min_args)
+    {
+        SendCliResponse("ERROR: Missing arguments\n");
+        SendCliResponse("Usage: %s\n", cli_cmd->usage);
+        print_help = false;
+        goto exit;
+    }
+
+    // Log a warning if there are too many arguments
+    if (num_args > cli_cmd->max_args)
+    {
+        SendCliResponse("WARNING: Discarding unused args: %s\n", args.vector[cli_cmd->max_args+1]);
+    }
+
+    // Process command
+    err = cli_cmd->exec_cmd(&args);
+    print_help = false;
+
+exit:
+    dump_to_cli = false;
+    if (print_help)
+    {
+        ExecuteCli_Help(NULL);
+    }
+
+    STR_VECTOR_Destroy(&args);
+    return err;
 }
 
 /*********************************************************************//**
@@ -472,136 +541,48 @@ void CloseCliServerSock(void)
 **
 ** Convenience function called when CLI argument's value is invalid for the command
 **
-** \param   arg - cli argument which is invalid
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - command and arguments
 **
 ** \return  None
 **
 **************************************************************************/
-void SendCliResponse_InvalidValue(char *arg, char *usage)
+void SendCliResponse_InvalidValue(str_vector_t *args)
 {
-    SendCliResponse("ERROR: Invalid value for argument: %s\n", arg);
-    SendCliResponse("Usage: %s\n", usage);
+    cli_cmd_t *cli_cmd;
+
+    cli_cmd = FindCliCommand(args->vector[0]);
+    USP_ASSERT(cli_cmd != NULL);
+
+    SendCliResponse("ERROR: Invalid value for argument: %s\n", args->vector[1]);
+    SendCliResponse("Usage: %s\n", cli_cmd->usage);
 }
 
 /*********************************************************************//**
 **
-** SplitArgs
+** FindCliCommand
 **
-** Splits the specified string into the specified number of args
-** NOTE: This function alters the input buffer pointed to by args
+** Finds the entry in cli_commands[] matching the specified command
 **
-** \param   args - string containing command line arguments for this command
-** \param   num_args - Number of arguments to expect for this command (0, 1 or 2)
-** \param   usage - pointer to string containing usage info for this command
-** \param   arg1 - pointer to variable in which to return a pointer to the first argument in the string
-** \param   arg2 - pointer to variable in which to return a pointer to the first argument in the string
+** \param   command - command to find
 **
-** \return  None
+** \return  Pointer to entry in cli_commands[] or NULL if no matching command found
 **
 **************************************************************************/
-int SplitArgs(char *args, int num_args, char *usage, char **arg1, char **arg2)
+cli_cmd_t *FindCliCommand(char *command)
 {
-    int result;
-    char *arg_end;
+    int i;
+    cli_cmd_t *cli_cmd;
 
-    *arg1 = NULL;
-    *arg2 = NULL;
-
-    // Exit if no args required for this command
-    if (num_args == 0)
+    for (i=0; i<NUM_ELEM(cli_commands); i++)
     {
-        result = USP_ERR_OK;
-        goto exit;
-    }
-
-    // Exit if args are required, but none are present
-    if (args == NULL)
-    {
-        SendCliResponse("ERROR: Missing arguments\n");
-        SendCliResponse("Usage: %s\n", usage);
-        result = USP_ERR_INVALID_ARGUMENTS;
-        goto exit;
-    }
-
-    // Split off the first argument, updating args to point to the argument after this one (or NULL if no more args)
-    *arg1 = args;
-    arg_end = strchr(args, CLI_SEPARATOR);
-    if (arg_end != NULL)
-    {
-        *arg_end = '\0';            // Make the argument into a string in the buffer by replacing the space with a NULL terminator
-        args = arg_end + 1;
-    }
-    else
-    {
-        args = NULL;
-    }
-
-    // Exit if we have got all the arguments required
-    if (num_args == 1)
-    {
-        result = USP_ERR_OK;
-        goto exit;
-    }
-
-    // Exit if another arg is required, but none are present
-    if (args == NULL)
-    {
-        SendCliResponse("ERROR: Missing arguments\n");
-        SendCliResponse("Usage: %s\n", usage);
-        result = USP_ERR_INVALID_ARGUMENTS;
-        goto exit;
-    }
-
-    // Split off the second argument, updating args to point to the argument after this one (or NULL if no more args)
-    *arg2 = args;
-    arg_end = strchr(args, CLI_SEPARATOR);
-    if (arg_end != NULL)
-    {
-        *arg_end = '\0';            // Make the argument into a string in the buffer by replacing the space with a NULL terminator
-        args = arg_end + 1;
-    }
-    else
-    {
-        args = NULL;
-    }
-    result = USP_ERR_OK;
-
-exit:
-    if (args != NULL)
-    {
-        RemoveSeparators(args);
-        SendCliResponse("WARNING: Discarding unused args: %s\n", args);
-    }
-
-    return result;
-}
-
-/*********************************************************************//**
-**
-** RemoveSeparators
-**
-** Replaces all separators with a space in the specified string
-**
-** \param   buf - buffer containing string to modify
-**
-** \return  None
-**
-**************************************************************************/
-void RemoveSeparators(char *buf)
-{
-    char *p;
-
-    p = buf;
-    while (*p != '\0')
-    {
-        // Replace separator with a space
-        if (*p == CLI_SEPARATOR)
+        cli_cmd = &cli_commands[i];
+        if (strcmp(cli_cmd->name, command)==0)
         {
-            *p = ' ';
+            return cli_cmd;
         }
-        p++;
     }
+
+    return NULL;
 }
 
 /*********************************************************************//**
@@ -610,14 +591,12 @@ void RemoveSeparators(char *buf)
 **
 ** Executes the help CLI command
 **
-** \param   arg1 - unused
-** \param   arg2 - unused
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - unused
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_Help(char *arg1, char *arg2, char *usage)
+int ExecuteCli_Help(str_vector_t *args)
 {
     int i;
     cli_cmd_t *cli_cmd;
@@ -640,17 +619,30 @@ int ExecuteCli_Help(char *arg1, char *arg2, char *usage)
 **
 ** Executes the version CLI command
 **
-** \param   arg1 - unused
-** \param   arg2 - unused
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - unused
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_Version(char *arg1, char *arg2, char *usage)
+int ExecuteCli_Version(str_vector_t *args)
 {
-    SendCliResponse("Version=%s\n", AGENT_SOFTWARE_VERSION);
+    SendCliResponse("Agent Version=%s\n", AGENT_SOFTWARE_VERSION);
+#ifndef REMOVE_DEVICE_SECURITY
+    SendCliResponse("OpenSSL Version=%s\n", OPENSSL_VERSION_TEXT);
+#endif
+    SendCliResponse("Sqlite Version=%s\n", SQLITE_VERSION);
+#ifndef REMOVE_DEVICE_BULKDATA
+    SendCliResponse("Curl Version=%s\n", curl_version());
+#endif
+    SendCliResponse("zlib Version=%s\n", ZLIB_VERSION);
 
+#ifdef ENABLE_MQTT
+    SendCliResponse("libmosquitto Version=%d.%d.%d\n", LIBMOSQUITTO_MAJOR, LIBMOSQUITTO_MINOR, LIBMOSQUITTO_REVISION);
+#endif
+
+#ifdef ENABLE_WEBSOCKETS
+    SendCliResponse("libwebsockets Version=%s\n", LWS_LIBRARY_VERSION);
+#endif
     return USP_ERR_OK;
 }
 
@@ -660,14 +652,12 @@ int ExecuteCli_Version(char *arg1, char *arg2, char *usage)
 **
 ** Executes the get CLI command
 **
-** \param   arg1 - data model path expression describing parameters to get
-** \param   arg2 - unused
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - Entry [1] data model path expression describing parameters to get
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_Get(char *arg1, char *arg2, char *usage)
+int ExecuteCli_Get(str_vector_t *args)
 {
     int i;
     int err;
@@ -675,11 +665,27 @@ int ExecuteCli_Get(char *arg1, char *arg2, char *usage)
     int_vector_t group_ids;
     group_get_vector_t ggv;
     group_get_entry_t *gge;
+    char *arg1;
+
+    USP_ASSERT(args->num_entries >= 2);
+    arg1 = args->vector[1];
+
+#ifndef REMOVE_USP_BROKER
+{
+    // Attempt to send and process a single get request to a USP Service, avoiding costly path resolution by the Broker
+    bool is_handled;
+    is_handled = USP_BROKER_AttemptDirectGetForCli(arg1);
+    if (is_handled)
+    {
+        return USP_ERR_OK;
+    }
+}
+#endif
 
     // Exit if unable to get a list of all parameters referenced by the expression
     STR_VECTOR_Init(&params);
     INT_VECTOR_Init(&group_ids);
-    err = PATH_RESOLVER_ResolvePath(arg1, &params, &group_ids, kResolveOp_Get, NULL, INTERNAL_ROLE, 0);
+    err = PATH_RESOLVER_ResolvePath(arg1, &params, &group_ids, kResolveOp_Get, FULL_DEPTH, INTERNAL_ROLE, 0);
     if (err != USP_ERR_OK)
     {
         STR_VECTOR_Destroy(&params);
@@ -725,22 +731,36 @@ int ExecuteCli_Get(char *arg1, char *arg2, char *usage)
 **
 ** Executes the set CLI command
 **
-** \param   arg1 - data model parameter to set
-** \param   arg2 - value of data model parameter to set
-** \param   usage - unused
+** \param   args - Entry [1] data model parameter to set
+**                 Entry [2] value of data model parameter to set
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_Set(char *arg1, char *arg2, char *usage)
+int ExecuteCli_Set(str_vector_t *args)
 {
     int i;
     int err;
-    char path[USP_ERR_MAXLEN];
+    char path[MAX_DM_PATH];
     dm_trans_vector_t trans;
     str_vector_t objects;
     char param_name[MAX_DM_PATH];
     char search_path[MAX_DM_PATH];
+    char *arg1;
+    char *arg2;
+
+    // Code to handle setting a parameter to an empty string
+    // Bash does not pass empty string arguments to executables, even if they are indicated as ""
+    if (args->num_entries >= 3)
+    {
+        arg2 = args->vector[2];
+    }
+    else
+    {
+        arg2 = "";
+    }
+
+    arg1 = args->vector[1];
 
     STR_VECTOR_Init(&objects);
 
@@ -753,7 +773,7 @@ int ExecuteCli_Set(char *arg1, char *arg2, char *usage)
     }
 
     // Exit if unable to get a list of all objects referenced by the expression
-    err = PATH_RESOLVER_ResolvePath(search_path, &objects, NULL, kResolveOp_Set, NULL, INTERNAL_ROLE, 0);
+    err = PATH_RESOLVER_ResolvePath(search_path, &objects, NULL, kResolveOp_Set, FULL_DEPTH, INTERNAL_ROLE, 0);
     if (err != USP_ERR_OK)
     {
         goto exit;
@@ -810,25 +830,27 @@ exit:
 ** NOTE: The CLI command for Add is different from the USP ADD message in that it accepts
 **       a fully qualified object with trailing instance number as well as an unqualified object
 **
-** \param   arg1 - object to add. This can be either with or without instance number to add.
-**                 (If without, an instance number will be automatically assigned)
-** \param   arg2 - unused
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - Entry [1] object to add. This can be either with or without instance number to add.
+**                          (If without, an instance number will be automatically assigned)
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_Add(char *arg1, char *arg2, char *usage)
+int ExecuteCli_Add(str_vector_t *args)
 {
     int i;
     int err;
-    char path[USP_ERR_MAXLEN];
+    char path[MAX_DM_PATH];
     dm_trans_vector_t trans;
     str_vector_t objects;
     char *instance_str;
     char *search_path;
     int instance_number;
     kv_vector_t unique_key_params;
+    char *arg1;
+
+    USP_ASSERT(args->num_entries >= 2);
+    arg1 = args->vector[1];
 
     // Split the object to add, into search path and (if one exists) instance number
     // NOTE: Trailing instance numbers may only be used on paths that do not contain complex search expressions
@@ -838,7 +860,7 @@ int ExecuteCli_Add(char *arg1, char *arg2, char *usage)
     search_path = arg1;
 
     // Exit if unable to get a list of all objects referenced by the expression
-    err = PATH_RESOLVER_ResolvePath(search_path, &objects, NULL, kResolveOp_Add, NULL, INTERNAL_ROLE, 0);
+    err = PATH_RESOLVER_ResolvePath(search_path, &objects, NULL, kResolveOp_Add, FULL_DEPTH, INTERNAL_ROLE, 0);
     if (err != USP_ERR_OK)
     {
         goto exit;
@@ -932,24 +954,26 @@ exit:
 **
 ** Executes the delete CLI command
 **
-** \param   arg1 - object to delete
-** \param   arg2 - unused
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - Entry [1] object to delete
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_Del(char *arg1, char *arg2, char *usage)
+int ExecuteCli_Del(str_vector_t *args)
 {
     int i;
     int err;
     dm_trans_vector_t trans;
     str_vector_t objects;
+    char *arg1;
+
+    USP_ASSERT(args->num_entries >= 2);
+    arg1 = args->vector[1];
 
     STR_VECTOR_Init(&objects);
 
     // Exit if unable to get a list of all objects referenced by the expression
-    err = PATH_RESOLVER_ResolvePath(arg1, &objects, NULL, kResolveOp_Del, NULL, INTERNAL_ROLE, 0);
+    err = PATH_RESOLVER_ResolvePath(arg1, &objects, NULL, kResolveOp_Del, FULL_DEPTH, INTERNAL_ROLE, 0);
     if (err != USP_ERR_OK)
     {
         goto exit;
@@ -1000,14 +1024,12 @@ exit:
 **
 ** Executes the operate CLI command
 **
-** \param   arg1 - operation (and args) to start
-** \param   arg2 - unused
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - Entry [1] operation (and args) to start
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_Operate(char *arg1, char *arg2, char *usage)
+int ExecuteCli_Operate(str_vector_t *args)
 {
     int i, j;
     int err;
@@ -1022,6 +1044,10 @@ int ExecuteCli_Operate(char *arg1, char *arg2, char *usage)
     char path[MAX_DM_PATH];
     expr_op_t valid_ops[] = {kExprOp_Equals};
     expr_vector_t temp_ev;
+    char *arg1;
+
+    USP_ASSERT(args->num_entries >= 2);
+    arg1 = args->vector[1];
 
     // Initialise all vectors used by this function
     KV_VECTOR_Init(&input_args);
@@ -1063,7 +1089,7 @@ int ExecuteCli_Operate(char *arg1, char *arg2, char *usage)
     EXPR_VECTOR_ToKeyValueVector(&temp_ev, &input_args);
 
     // Exit if unable to get a list of all operations referenced by the expression
-    err = PATH_RESOLVER_ResolvePath(path, &operations, NULL, kResolveOp_Oper, NULL, INTERNAL_ROLE, 0);
+    err = PATH_RESOLVER_ResolvePath(path, &operations, NULL, kResolveOp_Oper, FULL_DEPTH, INTERNAL_ROLE, 0);
     if (err != USP_ERR_OK)
     {
         goto exit;
@@ -1134,26 +1160,124 @@ exit:
 
 /*********************************************************************//**
 **
-** ExecuteCli_GetInstances
+** ExecuteCli_Event
 **
-** Executes the get instances CLI command
+** Executes the event CLI command
+** NOTE: A subscription must be in place for the event to be sent
 **
-** \param   arg1 - data model path expression describing object instances to get
-** \param   arg2 - unused
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - Entry [1] event (and args) to emit
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_GetInstances(char *arg1, char *arg2, char *usage)
+int ExecuteCli_Event(str_vector_t *args)
+{
+    int i;
+    int err;
+    str_vector_t events;
+    kv_vector_t event_args;
+    char *bracket_start;
+    char *bracket_end;
+    char *pling;
+    expr_op_t valid_ops[] = {kExprOp_Equals};
+    expr_vector_t temp_ev;
+    char *arg1;
+
+    USP_ASSERT(args->num_entries >= 2);
+    arg1 = args->vector[1];
+
+    // Initialise all vectors used by this function
+    KV_VECTOR_Init(&event_args);
+    EXPR_VECTOR_Init(&temp_ev);
+    STR_VECTOR_Init(&events);
+
+    // Exit if argument does not contain an exclamation mark
+    pling = TEXT_UTILS_StrStr(arg1, "!");
+    if (pling == NULL)
+    {
+        SendCliResponse("Missing exclamation mark in event name\n");
+        err = USP_ERR_INVALID_ARGUMENTS;
+        goto exit;
+    }
+
+    // Skip extracting arguments if none supplied
+    bracket_start = TEXT_UTILS_StrStr(arg1, "(");
+    if (bracket_start == NULL)
+    {
+        goto resolved;
+    }
+
+    // Exit if closing bracket is not present
+    bracket_end = TEXT_UTILS_StrStr(bracket_start, ")");
+    if (bracket_end == NULL)
+    {
+        SendCliResponse("Missing closing bracket around the arguments\n");
+        err = USP_ERR_INVALID_ARGUMENTS;
+        goto exit;
+    }
+
+    // Split off the arguments for the operation
+    *bracket_start = '\0';
+    *bracket_end= '\0';
+
+    // Exit if unable to extract the event_args into a temporary expression vector
+    err = EXPR_VECTOR_SplitExpressions(&bracket_start[1], &temp_ev, ",", valid_ops, NUM_ELEM(valid_ops), EXPR_FROM_CLI);
+    if (err != USP_ERR_OK)
+    {
+        goto exit;
+    }
+
+    // Convert the expression vector to a key-value vector, destroying the expression vector
+    EXPR_VECTOR_ToKeyValueVector(&temp_ev, &event_args);
+
+resolved:
+    // Exit if unable to get a list of all events referenced by the expression
+    err = PATH_RESOLVER_ResolvePath(arg1, &events, NULL, kResolveOp_Event, FULL_DEPTH, INTERNAL_ROLE, 0);
+    if (err != USP_ERR_OK)
+    {
+        goto exit;
+    }
+
+    // Iterate over all events to operate on
+    for (i=0; i < events.num_entries; i++)
+    {
+        SendCliResponse("Event (%s) being signalled\n", events.vector[i]);
+        DEVICE_SUBSCRIPTION_ProcessAllEventCompleteSubscriptions(events.vector[i], &event_args);
+    }
+
+    err = USP_ERR_OK;
+
+exit:
+    KV_VECTOR_Destroy(&event_args);
+    STR_VECTOR_Destroy(&events);
+    EXPR_VECTOR_Destroy(&temp_ev);
+    return err;
+}
+
+/*********************************************************************//**
+**
+** ExecuteCli_GetInstances
+**
+** Executes the get instances CLI command
+**
+** \param   args - Entry [1] data model path expression describing object instances to get
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int ExecuteCli_GetInstances(str_vector_t *args)
 {
     int i;
     int err;
     str_vector_t obj_paths;
+    char *arg1;
+
+    USP_ASSERT(args->num_entries >= 2);
+    arg1 = args->vector[1];
 
     // Exit if unable to get a list of all parameters referenced by the expression
     STR_VECTOR_Init(&obj_paths);
-    err = PATH_RESOLVER_ResolvePath(arg1, &obj_paths, NULL, kResolveOp_Instances, NULL, INTERNAL_ROLE, GET_ALL_INSTANCES);
+    err = PATH_RESOLVER_ResolvePath(arg1, &obj_paths, NULL, kResolveOp_Instances, FULL_DEPTH, INTERNAL_ROLE, GET_ALL_INSTANCES);
     if (err != USP_ERR_OK)
     {
         goto exit;
@@ -1183,23 +1307,17 @@ exit:
 **
 ** Executes the show CLI command
 **
-** \param   arg1 - enumeration of type of information to show
-** \param   arg2 - unused
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - Entry [1] enumeration of type of information to show
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_Show(char *arg1, char *arg2, char *usage)
+int ExecuteCli_Show(str_vector_t *args)
 {
-    // Show the data model schema if required
-    if (strcmp(arg1, "datamodel")==0)
-    {
-        USP_DUMP("WARNING: This is the data model of this CLI command, rather than the daemon instance of this executable");
-        USP_DUMP("If the data model does not contain 'Device.Test', then you are not running this CLI command with the '-T' option");
-        DATA_MODEL_DumpSchema();
-        return USP_ERR_OK;
-    }
+    char *arg1;
+
+    USP_ASSERT(args->num_entries >= 2);
+    arg1 = args->vector[1];
 
     // Show the contents of the database if required
     if (strcmp(arg1, "database")==0)
@@ -1209,7 +1327,7 @@ int ExecuteCli_Show(char *arg1, char *arg2, char *usage)
     }
 
     // If the code gets here, there is an unknown value for arg1
-    SendCliResponse_InvalidValue(arg1, usage);
+    SendCliResponse_InvalidValue(args);
     return USP_ERR_INVALID_ARGUMENTS;
 }
 
@@ -1219,15 +1337,25 @@ int ExecuteCli_Show(char *arg1, char *arg2, char *usage)
 **
 ** Executes the dump CLI command
 **
-** \param   arg1 - enumeration of type of information to show
-** \param   arg2 - unused
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - Entry [1] enumeration of type of information to show
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_Dump(char *arg1, char *arg2, char *usage)
+int ExecuteCli_Dump(str_vector_t *args)
 {
+    char *arg1;
+
+    USP_ASSERT(args->num_entries >= 2);
+    arg1 = args->vector[1];
+
+    // Show the data model schema if required
+    if (strcmp(arg1, "datamodel")==0)
+    {
+        DATA_MODEL_DumpSchema();
+        return USP_ERR_OK;
+    }
+
     // Show all memory usage
     if (strcmp(arg1, "memory")==0)
     {
@@ -1257,7 +1385,7 @@ int ExecuteCli_Dump(char *arg1, char *arg2, char *usage)
     }
 
     // If the code gets here, there is an unknown value for arg1
-    SendCliResponse_InvalidValue(arg1, usage);
+    SendCliResponse_InvalidValue(args);
     return USP_ERR_INVALID_ARGUMENTS;
 }
 
@@ -1267,46 +1395,57 @@ int ExecuteCli_Dump(char *arg1, char *arg2, char *usage)
 **
 ** Executes the perm CLI command
 **
-** \param   arg1 - data model path of parameter or object to get the permissions of
-** \param   arg2 - unused
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - Entry [1] data model path of parameter or object to get the permissions of
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_Perm(char *arg1, char *arg2, char *usage)
+int ExecuteCli_Perm(str_vector_t *args)
 {
-    int role;
+    int role_index;
     unsigned short perm;
     char path[MAX_DM_PATH];
-    char value[MAX_DM_VALUE_LEN];
+    char role_name[MAX_DM_SHORT_VALUE_LEN];
     combined_role_t combined_role;
+    int role_instance;
     int err;
+    char *arg1;
+
+    USP_ASSERT(args->num_entries >= 2);
+    arg1 = args->vector[1];
 
     // Iterate over all roles, getting the permissions for each role
-    for (role=0; role < kCTrustRole_Max; role++)
+    for (role_index=0; role_index < MAX_CTRUST_ROLES; role_index++)
     {
-        // Get the value of the specified parameter
-        USP_SNPRINTF(path, sizeof(path), "Device.LocalAgent.ControllerTrust.Role.%d.Name", role+1);
-        err = DATA_MODEL_GetParameterValue(path, value, sizeof(value), 0);
+        // Skip to next role index, if there is no role instance in this slot
+        role_instance = DEVICE_CTRUST_RoleIndexToInstance(role_index);
+        if (role_instance == INVALID)
+        {
+            continue;
+        }
+
+        // Get the name of the role
+        USP_SNPRINTF(path, sizeof(path), "Device.LocalAgent.ControllerTrust.Role.%d.Name", role_instance);
+        err = DATA_MODEL_GetParameterValue(path, role_name, sizeof(role_name), DONT_LOG_NO_INSTANCE_ERROR);
         if (err != USP_ERR_OK)
         {
-            goto exit;
+            continue;
         }
 
         // Get the permissions for the specified parameter or object
-        combined_role.inherited = role;
-        combined_role.assigned = role;
-        err = DATA_MODEL_GetPermissions(arg1, &combined_role, &perm);
+        combined_role.inherited_index = role_index;
+        combined_role.assigned_index = role_index;
+        err = DATA_MODEL_GetPermissions(arg1, &combined_role, &perm, 0);
         if (err != USP_ERR_OK)
         {
-            goto exit;
+            continue;
         }
 
         // Since successful, send back the permissions for the parameter
         #define PERMISSION_CHAR(bitmask, c, mask) ( ((bitmask & mask) == 0) ? '-' : c )
-        SendCliResponse("%s role: Param(%c%c-%c) Obj(%c%c-%c) InstantiatedObj (%c%c-%c) CommandEvent(%c-%c%c)\n",
-                         value,
+        SendCliResponse("Role.%d (Name=%s) : Param(%c%c-%c) Obj(%c%c-%c) InstantiatedObj(%c%c-%c) CommandEvent(%c-%c%c)\n",
+                         role_instance,
+                         role_name,
                          PERMISSION_CHAR(perm, 'r', PERMIT_GET),
                          PERMISSION_CHAR(perm, 'w', PERMIT_SET),
                          PERMISSION_CHAR(perm, 'n', PERMIT_SUBS_VAL_CHANGE),
@@ -1324,10 +1463,7 @@ int ExecuteCli_Perm(char *arg1, char *arg2, char *usage)
                          PERMISSION_CHAR(perm, 'n', PERMIT_SUBS_EVT_OPER_COMP) );
     }
 
-    err = USP_ERR_OK;
-
-exit:
-    return err;
+    return USP_ERR_OK;
 }
 
 /*********************************************************************//**
@@ -1336,20 +1472,22 @@ exit:
 **
 ** Executes the dbget CLI command
 **
-** \param   arg1 - data model parameter to get from the database
-** \param   arg2 - unused
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - Entry [1] data model parameter to get from the database
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_DbGet(char *param, char *arg2, char *usage)
+int ExecuteCli_DbGet(str_vector_t *args)
 {
     int err;
     dm_hash_t hash;
     char instances[MAX_DM_PATH];
     char value[MAX_DM_VALUE_LEN];
     unsigned path_flags;
+    char *param;
+
+    USP_ASSERT(args->num_entries >= 2);
+    param = args->vector[1];
 
     // Exit if parameter path is incorrect
     err = DM_PRIV_FormDB_FromPath(param, &hash, instances, sizeof(instances));
@@ -1360,7 +1498,7 @@ int ExecuteCli_DbGet(char *param, char *arg2, char *usage)
 
     // Exit, not printing any value, if this parameter is obfuscated (eg containing a password)
     value[0] = '\0';
-    path_flags = DATA_MODEL_GetPathProperties(param, INTERNAL_ROLE, NULL, NULL, NULL);
+    path_flags = DATA_MODEL_GetPathProperties(param, INTERNAL_ROLE, NULL, NULL, NULL, 0);
     if (path_flags & PP_IS_SECURE_PARAM)
     {
         goto exit;
@@ -1388,16 +1526,30 @@ exit:
 **
 ** Executes the dbset CLI command
 **
-** \param   param - data model parameter to set in the database
-** \param   value - value of data model parameter to set
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - Entry [1] data model parameter to set in the database
+**                 Entry [2] value of data model parameter to set
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_DbSet(char *param, char *value, char *usage)
+int ExecuteCli_DbSet(str_vector_t *args)
 {
     int err;
+    char *param;
+    char *value;
+
+    // Code to handle setting a parameter to an empty string
+    // Bash does not pass empty string arguments to executables, even if they are indicated as ""
+    if (args->num_entries >= 3)
+    {
+        value = args->vector[2];
+    }
+    else
+    {
+        value = "";
+    }
+
+    param = args->vector[1];
 
     // Exit if unable to directly set the parameter in the database
     err = DATA_MODEL_SetParameterInDatabase(param, value);
@@ -1418,18 +1570,20 @@ int ExecuteCli_DbSet(char *param, char *value, char *usage)
 **
 ** Executes the dbdel CLI command
 **
-** \param   arg1 - data model parameter to delete from the database
-** \param   arg2 - unused
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - Entry [1] data model parameter to delete from the database
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_DbDel(char *param, char *arg2, char *usage)
+int ExecuteCli_DbDel(str_vector_t *args)
 {
     int err;
     dm_hash_t hash;
     char instances[MAX_DM_PATH];
+    char *param;
+
+    USP_ASSERT(args->num_entries >= 2);
+    param = args->vector[1];
 
     // Exit if parameter path is incorrect
     err = DM_PRIV_FormDB_FromPath(param, &hash, instances, sizeof(instances));
@@ -1458,17 +1612,19 @@ int ExecuteCli_DbDel(char *param, char *arg2, char *usage)
 **
 ** Executes the verbose CLI command
 **
-** \param   arg1 - verbosity level
-** \param   arg2 - unused
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - Entry [1] verbosity level
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_Verbose(char *arg1, char *arg2, char *usage)
+int ExecuteCli_Verbose(str_vector_t *args)
 {
     int err;
     log_level_t level;
+    char *arg1;
+
+    USP_ASSERT(args->num_entries >= 2);
+    arg1 = args->vector[1];
 
     err = TEXT_UTILS_StringToUnsigned(arg1, &level);
     if ((err != USP_ERR_OK) || (level >= kLogLevel_Max))
@@ -1491,17 +1647,19 @@ int ExecuteCli_Verbose(char *arg1, char *arg2, char *usage)
 **
 ** Executes the prototrace CLI command
 **
-** \param   arg1 - Value setting whether protocol tracing is enabled or not (0=off, 1 = enabled)
-** \param   arg2 - unused
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - Entry [1] Value setting whether protocol tracing is enabled or not (0=off, 1 = enabled)
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_ProtoTrace(char *arg1, char *arg2, char *usage)
+int ExecuteCli_ProtoTrace(str_vector_t *args)
 {
     int err;
     log_level_t enable;
+    char *arg1;
+
+    USP_ASSERT(args->num_entries >= 2);
+    arg1 = args->vector[1];
 
     err = TEXT_UTILS_StringToUnsigned(arg1, &enable);
     if ((err != USP_ERR_OK) || (enable > 1))
@@ -1520,20 +1678,21 @@ int ExecuteCli_ProtoTrace(char *arg1, char *arg2, char *usage)
 
 /*********************************************************************//**
 **
-** ExecuteCli_stop
+** ExecuteCli_Stop
 **
 ** Executes the stop CLI command
 **
-** \param   arg1 - unused
-** \param   arg2 - unused
-** \param   usage - pointer to string containing usage info for this command
+** \param   args - unused
 **
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int ExecuteCli_Stop(char *arg1, char *arg2, char *usage)
+int ExecuteCli_Stop(str_vector_t *args)
 {
     // Signal that USP Agent should stop, once no queued messages to send
+#ifndef REMOVE_DEVICE_BULKDATA
+    BDC_EXEC_ScheduleExit();
+#endif
     MTP_EXEC_ScheduleExit();
     MTP_EXEC_ActivateScheduledActions();
 
@@ -1541,6 +1700,100 @@ int ExecuteCli_Stop(char *arg1, char *arg2, char *usage)
 
     return USP_ERR_OK;
 }
+
+#ifndef REMOVE_USP_SERVICE
+/*********************************************************************//**
+**
+** ExecuteCli_Register
+**
+** Executes the register CLI command, which sends a Register message on the UDS MTP
+**
+** \param   args - Entry [1] pointer to string containing comma separated list of data model objects to register
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int ExecuteCli_Register(str_vector_t *args)
+{
+    int err = USP_ERR_INTERNAL_ERROR;
+    char *endpoint_id;
+    char *arg1;
+
+    USP_ASSERT(args->num_entries >= 2);
+    arg1 = args->vector[1];
+
+    // Exit if not running as a USP Service
+    if (RUNNING_AS_USP_SERVICE()==false)
+    {
+        SendCliResponse("Cannot register. Not running as a USP service.\n");
+        goto exit;
+    }
+
+    // Exit if no controller found to send the register to
+    endpoint_id = DEVICE_CONTROLLER_FindFirstControllerEndpoint();
+    if (endpoint_id == NULL)
+    {
+        goto exit;
+    }
+
+    // Queue the register request
+    USP_SERVICE_QueueRegisterRequest(endpoint_id, arg1);
+    err = USP_ERR_OK;
+
+exit:
+    return err;
+}
+
+/*********************************************************************//**
+**
+** ExecuteCli_DeRegister
+**
+** Executes the deregister CLI command, which sends a Deregister message on the UDS MTP
+**
+** \param   args - Entry [1] pointer to string containing comma separated list of data model objects to deregister
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int ExecuteCli_DeRegister(str_vector_t *args)
+{
+    int err = USP_ERR_INTERNAL_ERROR;
+    char *endpoint_id;
+    char *arg1;
+
+    // Code to handle sending deregister with an empty string
+    // Bash does not pass empty string arguments to executables, even if they are indicated as ""
+    if (args->num_entries >= 2)
+    {
+        arg1 = args->vector[1];
+    }
+    else
+    {
+        arg1 = "";
+    }
+
+    // Exit if not running as a USP Service
+    if (RUNNING_AS_USP_SERVICE()==false)
+    {
+        SendCliResponse("Cannot deregister. Not running as a USP service.\n");
+        goto exit;
+    }
+
+    // Exit if no controller found to send the deregister to
+    endpoint_id = DEVICE_CONTROLLER_FindFirstControllerEndpoint();
+    if (endpoint_id == NULL)
+    {
+        goto exit;
+    }
+
+    // Queue the deregister request
+    USP_SERVICE_QueueDeregisterRequest(endpoint_id, arg1);
+    err = USP_ERR_OK;
+
+exit:
+    return err;
+}
+#endif
 
 /*********************************************************************//**
 **
@@ -1670,7 +1923,9 @@ int SplitSetExpression(char *expr, char *search_path, int search_path_len, char 
 **
 ** SendCliResponse
 **
-** Sends the printf-style formatted message back to the CLI client
+** Sends the printf-style formatted message back to the CLI client. In the
+** event that the buffer is too small, truncate the response, and make it
+** clear that it has been truncated
 **
 ** \param   fmt - printf style format
 **
@@ -1679,14 +1934,23 @@ int SplitSetExpression(char *expr, char *search_path, int search_path_len, char 
 **************************************************************************/
 void SendCliResponse(char *fmt, ...)
 {
+    #define MAX_CLI_RSP_LEN 4096
     va_list ap;
-    char buf[USP_ERR_MAXLEN];
+    char buf[MAX_CLI_RSP_LEN];
+    int chars_written;
 
-    // Write the USP error message into the local store
+    // Write the message into the local store
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    chars_written = vsnprintf(buf, sizeof(buf), fmt, ap);
     buf[sizeof(buf)-1] = '\0';
     va_end(ap);
+
+    // Ensure that if the message has been truncated, that it is reported
+    if (chars_written >= sizeof(buf)-1)
+    {
+        #define TRUNCATED_STR "...[truncated]...\n"
+        memcpy(&buf[sizeof(buf)-sizeof(TRUNCATED_STR)], TRUNCATED_STR, sizeof(TRUNCATED_STR));
+    }
 
     CLI_SERVER_SendResponse(buf);
 }
